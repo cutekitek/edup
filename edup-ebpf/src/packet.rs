@@ -41,6 +41,7 @@ pub struct Ip {
     pub proto: u8,
     pub ttl: u8,
     pub frag: u16,
+    pub v6: u8,
 }
 
 #[inline(always)]
@@ -66,6 +67,28 @@ pub fn ipv4(ctx: &XdpContext, offset: usize) -> Result<Ip, u32> {
         proto: read(ctx, offset + 9)?,
         ttl: read(ctx, offset + 8)?,
         frag: u16::from_be(read::<u16>(ctx, offset + 6)?),
+        v6: 0,
+    })
+}
+
+#[inline(always)]
+pub fn ipv6(ctx: &XdpContext, offset: usize) -> Result<Ip, u32> {
+    let len =
+        (core::hint::black_box(u16::from_be(read::<u16>(ctx, offset + 4)?) as usize) & 0xffff) + 40;
+    if read::<u8>(ctx, offset)? >> 4 != 6 || len == 40 || ctx.data() + offset + len > ctx.data_end()
+    {
+        return Err(stat::DROP_BAD_INNER);
+    }
+    Ok(Ip {
+        offset,
+        header_len: 40,
+        len,
+        src: 0,
+        dst: 0,
+        proto: read(ctx, offset + 6)?,
+        ttl: read(ctx, offset + 7)?,
+        frag: 0,
+        v6: 1,
     })
 }
 
@@ -100,16 +123,30 @@ pub fn transport(ctx: &XdpContext, ip: &Ip, outbound: bool) -> Result<Transport,
             )
         }
         IPPROTO_UDP => {
-            if len < 8 || u16::from_be(read::<u16>(ctx, offset + 4)?) as usize != len {
+            if len < 8
+                || u16::from_be(read::<u16>(ctx, offset + 4)?) as usize != len
+                || (ip.v6 != 0 && read::<u16>(ctx, offset + 6)? == 0)
+            {
                 return Err(stat::DROP_BAD_INNER);
             }
             (offset + if outbound { 0 } else { 2 }, offset + 6, 0)
         }
-        IPPROTO_ICMP => {
+        IPPROTO_ICMP if ip.v6 == 0 => {
             if len < 8 {
                 return Err(stat::DROP_BAD_INNER);
             }
             if read::<u8>(ctx, offset)? != if outbound { 8 } else { 0 }
+                || read::<u8>(ctx, offset + 1)? != 0
+            {
+                return Err(stat::DROP_PROTO);
+            }
+            (offset + 4, offset + 2, 0)
+        }
+        IPPROTO_ICMPV6 if ip.v6 != 0 => {
+            if len < 8 {
+                return Err(stat::DROP_BAD_INNER);
+            }
+            if read::<u8>(ctx, offset)? != if outbound { 128 } else { 129 }
                 || read::<u8>(ctx, offset + 1)? != 0
             {
                 return Err(stat::DROP_PROTO);
@@ -124,6 +161,42 @@ pub fn transport(ctx: &XdpContext, ip: &Ip, outbound: bool) -> Result<Transport,
         check_offset,
         flags,
     })
+}
+
+#[inline(never)]
+pub fn translate6(
+    ctx: &XdpContext,
+    ip: &Ip,
+    l4: &Transport,
+    address: &[u8; 16],
+    port_direction: u32,
+) -> Result<(), u32> {
+    let port = port_direction as u16;
+    let outbound = port_direction & (1 << 16) != 0;
+    if ip.ttl <= 1 {
+        return Err(stat::DROP_TTL);
+    }
+    let offset = ip.offset + if outbound { 8 } else { 24 };
+    let check = read::<u16>(ctx, l4.check_offset)?;
+    let mut sum = !check as u64 + !l4.port as u64 + port as u64;
+    let mut i = 0usize;
+    while i < 8 {
+        let old = read::<u16>(ctx, offset + i * 2)?;
+        // i < 8 guarantees this two-byte read is inside the 16-byte address.
+        sum += !old as u64
+            + unsafe { core::ptr::read_unaligned(address.as_ptr().add(i * 2).cast::<u16>()) }
+                as u64;
+        // Keep this bounded walk as a loop; unrolling spills all 128 address bits.
+        i = core::hint::black_box(i + 1);
+    }
+    let mut check = !csum::fold(sum);
+    if ip.proto == IPPROTO_UDP && check == 0 {
+        check = 0xffff;
+    }
+    write(ctx, l4.check_offset, check)?;
+    write(ctx, l4.port_offset, port)?;
+    write(ctx, offset, *address)?;
+    write(ctx, ip.offset + 7, ip.ttl - 1)
 }
 
 #[inline(always)]

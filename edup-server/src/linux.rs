@@ -6,18 +6,18 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use aya::{
     Ebpf,
-    maps::{Array, Map, MapData, PerCpuArray},
+    maps::{Array, HashMap, Map, MapData, PerCpuArray, ProgramArray},
     programs::{
         Xdp,
         links::{FdLink, LinkType, PinnedLink},
     },
 };
-use edup_common::maps::{Config, MAX_USERS, User, stat};
+use edup_common::maps::{Config, Endpoint, MAX_USERS, User, stat};
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
     io,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     os::{
         fd::AsRawFd,
         unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
@@ -25,7 +25,15 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const MAPS: [&str; 5] = ["CONFIG", "USERS", "NAT_OUT", "NAT_IN", "STATS"];
+const MAPS: [&str; 7] = [
+    "CONFIG",
+    "USERS",
+    "ENDPOINTS",
+    "NAT_OUT",
+    "NAT_IN",
+    "STATS",
+    "PROTOCOLS",
+];
 const OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/edup-ebpf"));
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -241,6 +249,22 @@ fn load(cfg: &Settings) -> Result<Ebpf> {
             0,
         )?;
     }
+    // Populate and pin the program array with this generation's protocol
+    // programs before attaching the dispatcher. Reload swaps the whole graph.
+    for (index, name) in ["edup_ipv4", "edup_ipv6"].into_iter().enumerate() {
+        let prog: &mut Xdp = bpf
+            .program_mut(name)
+            .with_context(|| format!("missing {name}"))?
+            .try_into()?;
+        prog.load()
+            .with_context(|| format!("kernel rejected {name}"))?;
+        let fd = prog.fd()?.try_clone()?;
+        ProgramArray::try_from(bpf.map_mut("PROTOCOLS").context("missing PROTOCOLS")?)?.set(
+            index as u32,
+            &fd,
+            0,
+        )?;
+    }
     let prog: &mut Xdp = bpf
         .program_mut("edup")
         .context("missing edup program")?
@@ -406,6 +430,9 @@ fn users(root: &Path) -> Result<()> {
     let config = pinned_array::<Config>(&active.path.join("CONFIG"))?.get(&0, 0)?;
     let users = pinned_array::<User>(&active.path.join("USERS"))?;
     ensure!(users.len() == MAX_USERS, "incompatible USERS ABI");
+    let endpoints = HashMap::<_, u16, Endpoint>::try_from(Map::HashMap(MapData::from_pin(
+        active.path.join("ENDPOINTS"),
+    )?))?;
     let now = sys::monotonic_ns()?;
     println!("ID\tTUNNEL_IP\tENDPOINT\tLAST_SEEN_SECONDS_AGO");
     for id in 0..MAX_USERS {
@@ -414,11 +441,23 @@ fn users(root: &Path) -> Result<()> {
             continue;
         }
         let ip = Ipv4Addr::from(config.tun_net + id);
-        if user.endpoint == 0 {
+        let endpoint = endpoints.get(&(id as u16), 0).ok();
+        if endpoint.is_none() {
             println!("{id}\t{ip}\t-\t-");
         } else {
-            let endpoint = Ipv4Addr::from(User::endpoint_ip_be(user.endpoint).to_ne_bytes());
-            let port = u16::from_be(User::endpoint_port_be(user.endpoint));
+            let ep = endpoint.unwrap();
+            let ip = if ep.v6 != 0 {
+                Ipv6Addr::from(edup_common::ipv6::address(config.tun_net6, id as u16)).to_string()
+            } else {
+                ip.to_string()
+            };
+            let endpoint = if ep.v6 != 0 {
+                format!("[{}]", Ipv6Addr::from(ep.address))
+            } else {
+                Ipv4Addr::new(ep.address[0], ep.address[1], ep.address[2], ep.address[3])
+                    .to_string()
+            };
+            let port = u16::from_be(ep.port_be);
             println!(
                 "{id}\t{ip}\t{endpoint}:{port}\t{}",
                 now.saturating_sub(user.last_seen_ns) / 1_000_000_000

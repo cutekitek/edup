@@ -9,6 +9,7 @@ pub const NAT_ENTRIES: u32 = 262_144;
 pub const IPPROTO_ICMP: u8 = 1;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
+pub const IPPROTO_ICMPV6: u8 = 58;
 
 /// Глобальная конфигурация: единственный элемент карты `CONFIG`.
 #[repr(C)]
@@ -27,8 +28,27 @@ pub struct Config {
     pub port_be: u16,
     pub nat_port_min: u16,
     pub nat_port_max: u16,
-    /// Максимальная длина внешнего IPv4-пакета (MTU исходящего интерфейса).
+    /// Maximum outer IP packet size (egress interface MTU).
     pub max_frame: u16,
+    /// All-zero addresses disable the corresponding IPv6 feature.
+    pub server_ip6: [u8; 16],
+    pub nat_ip6: [u8; 16],
+    pub tun_net6: [u8; 16],
+    /// Optional next-hop MAC overrides; zero uses the learned upstream MAC.
+    pub gateway_mac: [u8; 6],
+    pub gateway6_mac: [u8; 6],
+    pub _pad: [u8; 4],
+}
+
+/// Replaced atomically in ENDPOINTS so address, port and link-layer route agree.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Endpoint {
+    pub address: [u8; 16],
+    pub mac: [u8; 12],
+    pub port_be: u16,
+    pub v6: u8,
+    pub _pad: u8,
 }
 
 /// Значение карты `USERS`, индекс — ID пользователя.
@@ -69,7 +89,8 @@ pub struct NatOutKey {
     /// Порт TCP/UDP или идентификатор ICMP echo.
     pub inner_port_be: u16,
     pub proto: u8,
-    pub _pad: u8,
+    /// 0 for IPv4, 1 for IPv6. IPv6 uses the user's deterministic IPv4 ID here.
+    pub v6: u8,
 }
 
 #[repr(C)]
@@ -84,7 +105,7 @@ pub struct NatOutVal {
 pub struct NatInKey {
     pub pub_port_be: u16,
     pub proto: u8,
-    pub _pad: u8,
+    pub v6: u8,
 }
 
 /// Каноническая запись трансляции: здесь живут время и состояние.
@@ -165,6 +186,7 @@ pub mod stat {
 mod pod {
     use super::*;
     unsafe impl aya::Pod for Config {}
+    unsafe impl aya::Pod for Endpoint {}
     unsafe impl aya::Pod for User {}
     unsafe impl aya::Pod for NatOutKey {}
     unsafe impl aya::Pod for NatOutVal {}
@@ -173,7 +195,8 @@ mod pod {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<Config>() == 40);
+    assert!(core::mem::size_of::<Config>() == 104);
+    assert!(core::mem::size_of::<Endpoint>() == 32);
     assert!(core::mem::size_of::<User>() == 24);
     assert!(core::mem::size_of::<NatOutKey>() == 8);
     assert!(core::mem::size_of::<NatInKey>() == 4);

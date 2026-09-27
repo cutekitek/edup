@@ -10,3 +10,8 @@ routes = true
 offload = true
 # Windows: by default wintun.dll is loaded beside edup-client.exe.
 # wintun_dll = 'C:\Program Files\edup\wintun.dll'
+
+# IPv6 mode: change server to "[2001:db8::1]:7777", mtu to 1444,
+# and replace tunnel_net with the following (must match the server):
+# tunnel_net6 = "fd66::/112"
+# IPv6 requires mtu >= 1280; each mode carries only its own IP family.

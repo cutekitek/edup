@@ -3,7 +3,11 @@ use edup_common::wire;
 #[cfg(target_os = "linux")]
 use edup_common::{key::derive_key, maps::Config};
 use serde::Deserialize;
-use std::{collections::BTreeSet, net::Ipv4Addr, path::Path};
+use std::{
+    collections::BTreeSet,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +40,11 @@ pub struct Settings {
     pub interface: String,
     pub server_ip: Ipv4Addr,
     pub nat_ip: Ipv4Addr,
+    pub server_ip6: Option<Ipv6Addr>,
+    pub nat_ip6: Option<Ipv6Addr>,
+    pub tunnel_net6: Option<String>,
+    pub gateway_mac: Option<String>,
+    pub gateway6_mac: Option<String>,
     pub port: u16,
     pub password: String,
     pub tunnel_net: String,
@@ -75,6 +84,41 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        for ip in [self.server_ip6, self.nat_ip6].into_iter().flatten() {
+            ensure!(
+                edup_common::ipv6::unicast(ip.octets()),
+                "IPv6 addresses must be global/ULA unicast"
+            );
+        }
+        ensure!(
+            self.server_ip6.is_some() == self.nat_ip6.is_some(),
+            "server_ip6, nat_ip6 and tunnel_net6 must be configured together"
+        );
+        ensure!(
+            self.nat_ip6.is_some() == self.tunnel_net6.is_some(),
+            "nat_ip6 and tunnel_net6 must be configured together"
+        );
+        if let Some(net) = &self.tunnel_net6 {
+            let net = edup_common::ipv6::network(net)
+                .context("tunnel_net6 must be a global/ULA /112 network with zero host bits")?;
+            for ip in [self.server_ip6, self.nat_ip6].into_iter().flatten() {
+                ensure!(
+                    ip.octets()[..14] != net[..14],
+                    "outer IPv6 addresses must be outside tunnel_net6"
+                );
+            }
+            let overhead = if self.server_ip6.is_some() {
+                wire::OVERHEAD_V6
+            } else {
+                wire::OVERHEAD_V4
+            };
+            ensure!(
+                self.max_frame as usize >= 1280 + overhead,
+                "max_frame is too small for IPv6 tunnel MTU 1280"
+            );
+        }
+        parse_mac(self.gateway_mac.as_deref())?;
+        parse_mac(self.gateway6_mac.as_deref())?;
         ensure!(
             !self.interface.is_empty()
                 && self.interface.len() < 16
@@ -101,7 +145,7 @@ impl Settings {
             !(self.nat_port_min..=self.nat_port_max).contains(&self.port),
             "NAT range overlaps the tunnel port"
         );
-        let max = wire::MAX_KS_WORDS as usize * 8 + 32;
+        let max = wire::MAX_KS_WORDS as usize * 8 + if self.server_ip6.is_some() { 52 } else { 32 };
         ensure!(
             (576 + wire::OVERHEAD_V4..=max).contains(&(self.max_frame as usize)),
             "max_frame must be between {} and {max}",
@@ -183,8 +227,39 @@ impl Settings {
             nat_port_min: self.nat_port_min,
             nat_port_max: self.nat_port_max,
             max_frame: self.max_frame,
+            server_ip6: self.server_ip6.unwrap_or(Ipv6Addr::UNSPECIFIED).octets(),
+            nat_ip6: self.nat_ip6.unwrap_or(Ipv6Addr::UNSPECIFIED).octets(),
+            tun_net6: self
+                .tunnel_net6
+                .as_deref()
+                .and_then(edup_common::ipv6::network)
+                .unwrap_or([0; 16]),
+            gateway_mac: parse_mac(self.gateway_mac.as_deref())?,
+            gateway6_mac: parse_mac(self.gateway6_mac.as_deref())?,
+            _pad: [0; 4],
         })
     }
+}
+
+fn parse_mac(value: Option<&str>) -> Result<[u8; 6]> {
+    let Some(value) = value else {
+        return Ok([0; 6]);
+    };
+    let bytes = value
+        .split(':')
+        .map(|s| {
+            ensure!(s.len() == 2, "MAC must have six hexadecimal octets");
+            Ok(u8::from_str_radix(s, 16)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mac: [u8; 6] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("MAC must have six octets"))?;
+    ensure!(
+        mac != [0; 6] && mac[0] & 1 == 0,
+        "gateway MAC must be nonzero unicast"
+    );
+    Ok(mac)
 }
 
 fn unicast(ip: Ipv4Addr) -> bool {
@@ -257,6 +332,41 @@ mod tests {
             cfg.interface = interface.into();
             assert!(cfg.validate().is_err());
         }
+    }
+
+    #[test]
+    fn ipv6_settings_require_consistent_addresses_and_mtu() {
+        let mut c = config();
+        c.server_ip6 = Some("2001:db8::1".parse().unwrap());
+        assert!(c.validate().is_err());
+        c.nat_ip6 = c.server_ip6;
+        assert!(c.validate().is_err());
+        c.tunnel_net6 = Some("fd66::/112".into());
+        c.gateway6_mac = Some("02:01:02:03:04:05".into());
+        c.validate().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let raw = c.map_config().unwrap();
+            assert_eq!(raw.nat_ip6, c.nat_ip6.unwrap().octets());
+            assert_eq!(raw.gateway6_mac, [2, 1, 2, 3, 4, 5]);
+        }
+        c.max_frame = 1335;
+        assert!(c.validate().is_err());
+        c.max_frame = 1336;
+        c.validate().unwrap();
+        for mac in [
+            "",
+            "00:00:00:00:00:00",
+            "01:02:03:04:05:06",
+            "02:01:02:03:04",
+            "02:01:02:03:04:gg",
+        ] {
+            c.gateway6_mac = Some(mac.into());
+            assert!(c.validate().is_err(), "{mac}");
+        }
+        c.gateway6_mac = None;
+        c.nat_ip6 = Some("fd66::8".parse().unwrap());
+        assert!(c.validate().is_err());
     }
     #[cfg(target_os = "linux")]
     #[test]

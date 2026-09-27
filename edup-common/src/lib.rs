@@ -9,6 +9,7 @@
 extern crate std;
 
 pub mod csum;
+pub mod ipv6;
 pub mod maps;
 pub mod wire;
 

@@ -124,7 +124,7 @@ fn live_offload() -> Result<()> {
     ps(
         "foreach ($p in @('1.1.1.1/32','104.16.0.35/32')) {if (@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object DestinationPrefix -eq $p).Count) {throw 'live test destination already has a host route'}}",
     );
-    let physical = routes::PhysicalRoute::discover(*cfg.server.ip())?;
+    let physical = routes::PhysicalRoute::discover(cfg.server.ip())?;
     let socket = UdpSocket::bind((physical.source(), 0))?;
     socket.connect(cfg.server)?;
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;

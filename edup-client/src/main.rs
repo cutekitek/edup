@@ -27,7 +27,7 @@ use std::{
 use tun_rs::{DeviceBuilder, InterruptEvent, Layer, SyncDevice};
 
 #[derive(Parser)]
-#[command(version, about = "edup IPv4 TUN client for Linux and Windows")]
+#[command(version, about = "edup dual-stack TUN client for Linux and Windows")]
 struct Cli {
     #[arg(short, long, global = true, default_value = "client.toml")]
     config: PathBuf,
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
         Command::Check => {
             println!(
                 "Configuration valid: {} -> {}, MTU={}, routes={}",
-                cfg.address()?,
+                tunnel_address(&cfg)?,
                 cfg.server,
                 cfg.mtu,
                 cfg.routes
@@ -99,7 +99,7 @@ fn run(cfg: config::Settings) -> Result<()> {
     })
     .context("install shutdown handler")?;
     routes::ensure_available(&cfg.interface)?;
-    let physical = routes::PhysicalRoute::discover(*cfg.server.ip())?;
+    let physical = routes::PhysicalRoute::discover(cfg.server.ip())?;
     let socket =
         UdpSocket::bind((physical.source(), 0)).context("bind UDP on physical source address")?;
     // Windows defaults to a small UDP queue. XDP returns bursts directly from
@@ -115,14 +115,14 @@ fn run(cfg: config::Settings) -> Result<()> {
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     socket.set_write_timeout(Some(Duration::from_millis(200)))?;
     let socket = udp::Transport::new(socket, cfg.offload).context("configure UDP offload")?;
-    let address = cfg.address()?;
+    let address = tunnel_address(&cfg)?;
     let tun = create_device(&cfg)?;
     let mut routes = if cfg.routes {
         Some(routes::Routes::install(
             &physical,
             &cfg.interface,
             tun.if_index()?,
-            *cfg.server.ip(),
+            cfg.server.ip(),
         )?)
     } else {
         None
@@ -161,12 +161,29 @@ fn run(cfg: config::Settings) -> Result<()> {
     result.and(cleanup)
 }
 
+fn tunnel_address(cfg: &config::Settings) -> Result<std::net::IpAddr> {
+    if let Some(address) = cfg.address6()? {
+        Ok(address.into())
+    } else {
+        Ok(cfg.address()?.into())
+    }
+}
+
 fn create_device(cfg: &config::Settings) -> Result<SyncDevice> {
     let builder = DeviceBuilder::new()
         .name(&cfg.interface)
         .layer(Layer::L3)
-        .ipv4(cfg.address()?, 32, None)
         .enable(true);
+    let builder = if cfg.server.is_ipv4() {
+        builder.ipv4(cfg.address()?, 32, None)
+    } else {
+        builder
+    };
+    let builder = if let Some(address) = cfg.address6()? {
+        builder.ipv6(address, 128)
+    } else {
+        builder
+    };
     #[cfg(target_os = "linux")]
     let builder = builder.mtu(cfg.mtu).offload(cfg.offload);
     #[cfg(target_os = "windows")]
@@ -177,10 +194,13 @@ fn create_device(cfg: &config::Settings) -> Result<SyncDevice> {
             .unwrap_or(std::env::current_exe()?.with_file_name("wintun.dll"));
         ensure!(dll.is_file(), "wintun.dll missing: {}", dll.display());
         // DeviceBuilder::mtu sets both IP families on Windows. IPv6 rejects
-        // MTU <1280 (ERROR_INVALID_PARAMETER), even for this IPv4-only tunnel.
-        builder
-            .mtu_v4(cfg.mtu)
-            .wintun_file(dll.to_str().context("DLL path must be Unicode")?.to_owned())
+        // MTU <1280 (ERROR_INVALID_PARAMETER), even for an IPv4-only tunnel.
+        let builder = if cfg.server.is_ipv6() {
+            builder.mtu_v6(cfg.mtu)
+        } else {
+            builder.mtu_v4(cfg.mtu)
+        };
+        builder.wintun_file(dll.to_str().context("DLL path must be Unicode")?.to_owned())
     };
     let tun = builder
         .build_sync()
@@ -197,11 +217,20 @@ fn create_device(cfg: &config::Settings) -> Result<SyncDevice> {
             let tun = DeviceBuilder::new()
                 .name(&cfg.interface)
                 .layer(Layer::L3)
-                .ipv4(cfg.address()?, 32, None)
                 .enable(true)
                 .mtu(cfg.mtu)
-                .offload(false)
-                .build_sync()?;
+                .offload(false);
+            let tun = if cfg.server.is_ipv4() {
+                tun.ipv4(cfg.address()?, 32, None)
+            } else {
+                tun
+            };
+            let tun = if let Some(address) = cfg.address6()? {
+                tun.ipv6(address, 128)
+            } else {
+                tun
+            }
+            .build_sync()?;
             tun.set_nonblocking(true)?;
             return Ok(tun);
         }
@@ -230,6 +259,7 @@ fn send_loop(
     let mut reader = tun_io::Reader::new();
     let mut batch = udp::Batch::new();
     let address = cfg.address()?.octets();
+    let address6 = cfg.address6()?.map(|ip| ip.octets());
     while !stop.load(Relaxed) {
         let mut processed = 0;
         while processed < udp::MAX_SEGMENTS && !stop.load(Relaxed) {
@@ -251,7 +281,8 @@ fn send_loop(
                 let len = reader.sizes[i];
                 let data = &mut reader.packets[i][..wire::HDR_LEN + len];
                 let payload = &mut data[wire::HDR_LEN..];
-                let Some(ihl) = packet::validate(payload, address, true, cfg.mtu) else {
+                let Some(ihl) = packet::validate_family(payload, address, address6, true, cfg.mtu)
+                else {
                     counts.dropped.fetch_add(1, Relaxed);
                     continue;
                 };
@@ -322,6 +353,7 @@ fn receive_loop(
     #[cfg(target_os = "linux")]
     let mut writer = tun_io::Writer::new();
     let address = cfg.address()?.octets();
+    let address6 = cfg.address6()?.map(|ip| ip.octets());
     let mut next = Instant::now();
     let diagnostics = std::env::var_os("EDUP_DIAGNOSTICS").is_some();
     let mut report_at = Instant::now() + Duration::from_secs(5);
@@ -368,7 +400,7 @@ fn receive_loop(
             if stop.load(Relaxed) {
                 break;
             }
-            if let Some(payload) = decode_packet(data, cfg, key, address, counts) {
+            if let Some(payload) = decode_packet(data, cfg, key, address, address6, counts) {
                 #[cfg(target_os = "linux")]
                 {
                     writer.push(payload);
@@ -440,6 +472,7 @@ fn decode_packet<'a>(
     cfg: &config::Settings,
     key: &Key,
     address: [u8; 4],
+    address6: Option<[u8; 16]>,
     counts: &Counters,
 ) -> Option<&'a mut [u8]> {
     let len = data.len();
@@ -464,7 +497,7 @@ fn decode_packet<'a>(
         return None;
     }
     let payload = &mut data[wire::HDR_LEN..];
-    let Some(ihl) = packet::validate(payload, address, false, cfg.mtu) else {
+    let Some(ihl) = packet::validate_family(payload, address, address6, false, cfg.mtu) else {
         counts.dropped.fetch_add(1, Relaxed);
         return None;
     };
@@ -524,12 +557,13 @@ mod receive_tests {
         let counts = Counters::default();
         let mut accepted = 0;
         for packet in aggregate.chunks_mut(wire::HDR_LEN + 40) {
-            accepted += usize::from(decode_packet(packet, &cfg, &key, address, &counts).is_some());
+            accepted +=
+                usize::from(decode_packet(packet, &cfg, &key, address, None, &counts).is_some());
         }
         assert_eq!(accepted, 2);
         assert_eq!(counts.dropped.load(Relaxed), 2);
         assert_eq!(counts.keepalive_received.load(Relaxed), 1);
         // Concatenation without kernel segment metadata is never decoded as a batch.
-        assert!(decode_packet(&mut aggregate, &cfg, &key, address, &counts).is_none());
+        assert!(decode_packet(&mut aggregate, &cfg, &key, address, None, &counts).is_none());
     }
 }

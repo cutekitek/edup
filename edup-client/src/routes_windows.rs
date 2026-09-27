@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use std::{net::Ipv4Addr, os::windows::process::CommandExt, process::Command};
+use std::{net::IpAddr, os::windows::process::CommandExt, process::Command};
 
 // Scripts interpolate only parsed IP addresses, integer indices and a validated
 // ASCII interface name. Passwords and paths never enter PowerShell command text.
@@ -20,17 +20,17 @@ fn ps(script: &str) -> Result<String> {
 #[derive(Deserialize)]
 pub struct PhysicalRoute {
     index: u32,
-    source: Ipv4Addr,
-    gateway: Ipv4Addr,
+    source: IpAddr,
+    gateway: IpAddr,
 }
 impl PhysicalRoute {
-    pub fn discover(server: Ipv4Addr) -> Result<Self> {
+    pub fn discover(server: IpAddr) -> Result<Self> {
         let text = ps(&format!(
-            "$r=@(Find-NetRoute -RemoteIPAddress '{server}'); $a=$r | Where-Object {{$_.PSObject.Properties.Name -contains 'IPAddress'}} | Select-Object -First 1; $n=$r | Where-Object {{$_.PSObject.Properties.Name -contains 'NextHop'}} | Select-Object -First 1; if (!$a -or !$n) {{throw 'No physical IPv4 route'}}; @{{index=[uint32]$n.InterfaceIndex; source=[string]$a.IPAddress; gateway=[string]$n.NextHop}} | ConvertTo-Json -Compress"
+            "$r=@(Find-NetRoute -RemoteIPAddress '{server}'); $a=$r | Where-Object {{$_.PSObject.Properties.Name -contains 'IPAddress'}} | Select-Object -First 1; $n=$r | Where-Object {{$_.PSObject.Properties.Name -contains 'NextHop'}} | Select-Object -First 1; if (!$a -or !$n) {{throw 'No physical route'}}; @{{index=[uint32]$n.InterfaceIndex; source=[string]$a.IPAddress; gateway=[string]$n.NextHop}} | ConvertTo-Json -Compress"
         ))?;
         serde_json::from_str(&text).context("read physical Windows route")
     }
-    pub fn source(&self) -> Ipv4Addr {
+    pub fn source(&self) -> IpAddr {
         self.source
     }
 }
@@ -46,14 +46,14 @@ pub fn ensure_available(name: &str) -> Result<()> {
 }
 fn existing(prefix: &str) -> Result<bool> {
     let count = ps(&format!(
-        "@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object {{$_.DestinationPrefix -eq '{prefix}'}}).Count"
+        "@(Get-NetRoute -PolicyStore ActiveStore | Where-Object {{$_.DestinationPrefix -eq '{prefix}'}}).Count"
     ))?;
     Ok(count.parse::<u32>()? != 0)
 }
 pub struct Route {
     prefix: String,
     index: u32,
-    gateway: Ipv4Addr,
+    gateway: IpAddr,
 }
 impl Route {
     pub fn add(&self) -> Result<()> {
@@ -65,7 +65,7 @@ impl Route {
     }
     pub fn remove(&self) -> Result<()> {
         ps(&format!(
-            "Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object {{$_.DestinationPrefix -eq '{}' -and $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' -and $_.RouteMetric -eq 42760}} | Remove-NetRoute -Confirm:$false",
+            "Get-NetRoute -PolicyStore ActiveStore | Where-Object {{$_.DestinationPrefix -eq '{}' -and $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' -and $_.RouteMetric -eq 42760}} | Remove-NetRoute -Confirm:$false",
             self.prefix, self.index, self.gateway
         ))?;
         Ok(())
@@ -75,16 +75,21 @@ pub fn plan(
     physical: &PhysicalRoute,
     _interface: &str,
     index: u32,
-    server: Ipv4Addr,
+    server: IpAddr,
 ) -> Result<Vec<Route>> {
-    for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
+    let prefixes = if server.is_ipv6() {
+        ["::/1", "8000::/1"]
+    } else {
+        ["0.0.0.0/1", "128.0.0.0/1"]
+    };
+    for prefix in prefixes {
         ensure!(
             !existing(prefix)?,
             "route {prefix} already exists; stop the other tunnel or use routes=false"
         );
     }
     let mut result = Vec::new();
-    let host = format!("{server}/32");
+    let host = format!("{server}/{}", if server.is_ipv6() { 128 } else { 32 });
     if !existing(&host)? {
         result.push(Route {
             prefix: host,
@@ -92,11 +97,15 @@ pub fn plan(
             gateway: physical.gateway,
         });
     }
-    for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
+    for prefix in prefixes {
         result.push(Route {
             prefix: prefix.into(),
             index,
-            gateway: Ipv4Addr::UNSPECIFIED,
+            gateway: if prefix.contains(':') {
+                "::".parse().unwrap()
+            } else {
+                "0.0.0.0".parse().unwrap()
+            },
         });
     }
     Ok(result)

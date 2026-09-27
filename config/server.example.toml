@@ -10,3 +10,12 @@ max_frame = 1500
 # "driver" is native XDP. "skb" must be selected explicitly for diagnostics.
 xdp_mode = "driver"
 users = [7, 42]
+
+# Optional IPv6 mode: configure all three fields (addresses must exist on NIC).
+# server_ip6 = "2001:db8::1"
+# IPv6 Internet forwarding uses NAT66.
+# nat_ip6 = "2001:db8::1"
+# tunnel_net6 = "fd66::/112"
+# Override next-hop MACs when the tunnel peer is not the Internet gateway.
+# gateway_mac = "02:01:02:03:04:05"
+# gateway6_mac = "02:01:02:03:04:06"

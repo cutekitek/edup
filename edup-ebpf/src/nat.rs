@@ -99,7 +99,7 @@ pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -
         let reverse = NatInKey {
             pub_port_be: port,
             proto: key.proto,
-            _pad: 0,
+            v6: key.v6,
         };
         if let Some(v) = snapshot(&reverse) {
             if owner(&v, key, user) && alive(&v, key.proto, now) {
@@ -131,7 +131,7 @@ pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -
         let reverse = NatInKey {
             pub_port_be: port.to_be(),
             proto: key.proto,
-            _pad: 0,
+            v6: key.v6,
         };
         if let Some(v) = snapshot(&reverse) {
             expire(&reverse, &v, now);
@@ -162,7 +162,7 @@ pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -
             let reverse = NatInKey {
                 pub_port_be: port,
                 proto: key.proto,
-                _pad: 0,
+                v6: key.v6,
             };
             if let Some(v) = snapshot(&reverse)
                 && owner(&v, key, user)
@@ -187,7 +187,7 @@ pub fn inbound(key: &NatInKey, flags: u8, now: u64) -> Option<NatInVal> {
         inner_ip_be: v.inner_ip_be,
         inner_port_be: v.inner_port_be,
         proto: key.proto,
-        _pad: 0,
+        v6: key.v6,
     };
     let ptr = NAT_OUT.get_ptr(forward)?;
     if unsafe { core::ptr::read_volatile(ptr).pub_port_be } != key.pub_port_be {

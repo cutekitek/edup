@@ -21,6 +21,8 @@ pub const NONCE_LEN: usize = 4;
 pub const HDR_LEN: usize = 8;
 /// Накладные расходы на внешний IPv4 + UDP + заголовок edup.
 pub const OVERHEAD_V4: usize = 20 + 8 + HDR_LEN;
+/// IPv6 + UDP + edup header.
+pub const OVERHEAD_V6: usize = 40 + 8 + HDR_LEN;
 
 pub const MAGIC: u8 = 0xED;
 

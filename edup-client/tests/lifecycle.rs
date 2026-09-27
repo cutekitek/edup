@@ -88,12 +88,31 @@ fn assert_clean() {
 #[test]
 #[ignore = "requires root, iproute2, ping, unshare and /dev/net/tun; isolated namespaces"]
 fn isolated_client() {
+    isolated(false);
+}
+
+#[test]
+#[ignore = "requires root, iproute2, ping, unshare and /dev/net/tun; isolated namespaces"]
+fn isolated_ipv6_client() {
+    isolated(true);
+}
+
+fn isolated(ipv6: bool) {
     if std::env::var_os("EDUP_CLIENT_NS").is_none() {
         assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
         let status = Command::new("unshare")
             .args(["--mount", "--net"])
             .arg(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", "isolated_client", "--nocapture"])
+            .args([
+                "--ignored",
+                "--exact",
+                if ipv6 {
+                    "isolated_ipv6_client"
+                } else {
+                    "isolated_client"
+                },
+                "--nocapture",
+            ])
             .env("EDUP_CLIENT_NS", "1")
             .status()
             .unwrap();
@@ -110,6 +129,14 @@ fn isolated_client() {
             .replace("keepalive_secs = 15", "keepalive_secs = 1"),
     )
     .unwrap();
+    if ipv6 {
+        let path = dir.join("client.toml");
+        let config = fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"192.0.2.1:7777\"", "\"[2001:db8:1::1]:7777\"")
+            .replace("mtu = 1464", "mtu = 1444");
+        fs::write(path, format!("{config}\ntunnel_net6 = \"fd66::/112\"\n")).unwrap();
+    }
     ip(&["link", "set", "lo", "up"]);
     ip(&[
         "link",
@@ -127,6 +154,7 @@ fn isolated_client() {
             .arg(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "echo_peer", "--nocapture"])
             .env("EDUP_PEER_DIR", &dir)
+            .env("EDUP_PEER_IPV6", if ipv6 { "1" } else { "0" })
             .spawn()
             .unwrap(),
     );
@@ -136,6 +164,18 @@ fn isolated_client() {
     ip(&["addr", "add", "192.0.2.2/24", "dev", "edup-test0"]);
     ip(&["link", "set", "edup-test0", "up"]);
     ip(&["route", "add", "default", "via", "192.0.2.1"]);
+    if ipv6 {
+        ip(&[
+            "-6",
+            "addr",
+            "add",
+            "2001:db8:1::2/64",
+            "dev",
+            "edup-test0",
+            "nodad",
+        ]);
+        ip(&["-6", "route", "add", "default", "via", "2001:db8:1::1"]);
+    }
     wait_for(|| dir.join("peer-ready").exists());
 
     let mut first = client(&dir);
@@ -146,13 +186,19 @@ fn isolated_client() {
         .unwrap();
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already exists"));
-    assert!(ip(&["route", "get", "203.0.113.9"]).contains("dev edup0"));
+    let destination = if ipv6 { "2001:db8:2::9" } else { "203.0.113.9" };
+    assert!(ip(&["route", "get", destination]).contains("dev edup0"));
     assert!(ip(&["route", "get", "192.0.2.1"]).contains("dev edup-test0"));
-    checked("ping", &["-n", "-c", "2", "-W", "3", "203.0.113.9"]);
-    let udp = UdpSocket::bind("10.66.0.7:0").unwrap();
-    udp.connect("203.0.113.9:9000").unwrap();
+    checked("ping", &["-n", "-c", "2", "-W", "3", destination]);
+    let udp = UdpSocket::bind(if ipv6 { "[fd66::7]:0" } else { "10.66.0.7:0" }).unwrap();
+    udp.connect(if ipv6 {
+        "[2001:db8:2::9]:9000"
+    } else {
+        "203.0.113.9:9000"
+    })
+    .unwrap();
     udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let payload = [0x5au8; 1400];
+    let payload = vec![0x5au8; if ipv6 { 1396 } else { 1400 }];
     udp.send(&payload).unwrap();
     let mut reply = [0u8; 1500];
     let len = udp.recv(&mut reply).unwrap();
@@ -197,7 +243,7 @@ fn isolated_client() {
 
     // Fail the third route addition after the first two actually reach the kernel.
     // Only this child sees the ip wrapper; cleanup calls use the real ip binary.
-    fs::write(dir.join("ip"), "#!/bin/sh\nif [ \"$1 $2 $3 $4\" = \"-4 route add 128.0.0.0/1\" ]; then\n  echo injected-route-failure >&2\n  exit 1\nfi\nexec /usr/bin/ip \"$@\"\n").unwrap();
+    fs::write(dir.join("ip"), "#!/bin/sh\nif [ \"$1 $2 $3 $4\" = \"-4 route add 128.0.0.0/1\" ]; then\n  echo injected-route-failure >&2\n  exit 1\nfi\nexec /usr/bin/ip \"$@\"\n".replace("-4 route add 128.0.0.0/1", if ipv6 { "-6 route add 8000::/1" } else { "-4 route add 128.0.0.0/1" })).unwrap();
     fs::set_permissions(dir.join("ip"), fs::Permissions::from_mode(0o755)).unwrap();
     let mut partial = client_with_path(&dir, Some(&format!("{}:/usr/bin:/bin", dir.display())));
     let mut status = None;
@@ -235,13 +281,33 @@ fn isolated_client() {
     .unwrap();
     let mut second = client(&dir);
     started(&dir, &mut second);
-    checked("ping", &["-n", "-c", "1", "-W", "3", "203.0.113.9"]);
+    checked("ping", &["-n", "-c", "1", "-W", "3", destination]);
+    if ipv6 {
+        assert!(ip(&["-6", "route", "get", "2001:db8:2::9"]).contains("dev edup0"));
+        assert!(ip(&["-6", "route", "get", "2001:db8:1::1"]).contains("dev edup-test0"));
+        checked("ping", &["-6", "-n", "-c", "2", "-W", "3", "2001:db8:2::9"]);
+        let udp6 = UdpSocket::bind("[fd66::7]:0").unwrap();
+        udp6.connect("[2001:db8:2::9]:9000").unwrap();
+        udp6.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let payload = [0x59; 1396]; // 1444-byte IPv6 packet, 1500-byte outer packet
+        udp6.send(&payload).unwrap();
+        let mut data = [0; 1500];
+        let n = udp6.recv(&mut data).unwrap();
+        assert_eq!(&data[..n], &payload);
+    }
     stop(&mut second);
+    if ipv6 {
+        for prefix in ["::/1", "8000::/1", "2001:db8:1::1/128"] {
+            assert!(ip(&["-6", "route", "show", "exact", prefix]).is_empty());
+        }
+    }
     assert_clean();
     assert!(ip(&["route", "show", "exact", "192.0.2.1/32"]).contains("metric 123"));
 
     // Conflicting VPN routes fail after TUN creation without replacing routes.
-    ip(&["route", "add", "0.0.0.0/1", "via", "192.0.2.1"]);
+    let conflict_prefix = if ipv6 { "::/1" } else { "0.0.0.0/1" };
+    let gateway = if ipv6 { "2001:db8:1::1" } else { "192.0.2.1" };
+    ip(&["route", "add", conflict_prefix, "via", gateway]);
     let mut conflict = client(&dir);
     let mut status = None;
     wait_for(|| {
@@ -250,7 +316,16 @@ fn isolated_client() {
     });
     assert!(!status.unwrap().success());
     assert!(!ip(&["-j", "link", "show"]).contains("edup0"));
-    assert!(ip(&["route", "show", "exact", "0.0.0.0/1"]).contains("via 192.0.2.1"));
+    assert!(
+        ip(&[
+            if ipv6 { "-6" } else { "-4" },
+            "route",
+            "show",
+            "exact",
+            conflict_prefix
+        ])
+        .contains(gateway)
+    );
     assert!(ip(&["route", "show", "exact", "128.0.0.0/1"]).is_empty());
     assert!(
         fs::read_to_string(dir.join("client.log"))
@@ -320,7 +395,24 @@ fn echo_peer() {
     });
     ip(&["addr", "add", "192.0.2.1/24", "dev", "edup-peer0"]);
     ip(&["link", "set", "edup-peer0", "up"]);
-    let socket = UdpSocket::bind("192.0.2.1:7777").unwrap();
+    let ipv6 = std::env::var("EDUP_PEER_IPV6").as_deref() == Ok("1");
+    if ipv6 {
+        ip(&[
+            "-6",
+            "addr",
+            "add",
+            "2001:db8:1::1/64",
+            "dev",
+            "edup-peer0",
+            "nodad",
+        ]);
+    }
+    let socket = UdpSocket::bind(if ipv6 {
+        "[2001:db8:1::1]:7777"
+    } else {
+        "192.0.2.1:7777"
+    })
+    .unwrap();
     socket
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
@@ -347,8 +439,8 @@ fn echo_peer() {
         let opened = wire::open(&key, &mut buf[..len]).unwrap();
         assert_eq!(opened.user, 7);
         let burst = opened.typ == wire::TYPE_DATA
-            && len == wire::HDR_LEN + 20 + 8 + 1000
-            && buf[wire::HDR_LEN + 28] == 0x6b;
+            && len == wire::HDR_LEN + if ipv6 { 40 } else { 20 } + 8 + 1000
+            && buf[wire::HDR_LEN + if ipv6 { 48 } else { 28 }] == 0x6b;
         if opened.typ == wire::TYPE_KEEPALIVE {
             keepalives += 1;
             fs::write(dir.join("keepalives"), keepalives.to_string()).unwrap();
@@ -361,45 +453,69 @@ fn echo_peer() {
             }
         } else {
             let ip = &mut buf[wire::HDR_LEN..len];
-            let ihl = usize::from(ip[0] & 15) * 4;
-            assert_eq!(
-                checksum(&ip[..ihl]),
-                0,
-                "TUN segmentation must complete IPv4 checksum"
-            );
-            if ip[9] == 17 && ip[ihl + 6..ihl + 8] != [0, 0] {
+            if ip[0] >> 4 == 6 {
+                assert_eq!(l4_checksum6(ip), 0, "IPv6 TUN checksum");
+                for i in 0..16 {
+                    ip.swap(8 + i, 24 + i);
+                }
+                let check_offset = match ip[6] {
+                    58 => {
+                        assert_eq!(ip[40], 128);
+                        ip[40] = 129;
+                        42
+                    }
+                    17 => {
+                        ip.swap(40, 42);
+                        ip.swap(41, 43);
+                        46
+                    }
+                    p => panic!("unexpected IPv6 protocol {p}"),
+                };
+                ip[check_offset..check_offset + 2].fill(0);
+                let sum = l4_checksum6(ip);
+                ip[check_offset..check_offset + 2]
+                    .copy_from_slice(&if sum == 0 { 0xffff } else { sum }.to_be_bytes());
+            } else {
+                let ihl = usize::from(ip[0] & 15) * 4;
                 assert_eq!(
-                    l4_checksum(ip),
+                    checksum(&ip[..ihl]),
                     0,
-                    "TUN segmentation must complete UDP checksum"
+                    "TUN segmentation must complete IPv4 checksum"
                 );
-            }
-            for i in 0..4 {
-                ip.swap(12 + i, 16 + i);
-            }
-            match ip[9] {
-                1 => {
-                    assert_eq!(ip[ihl], 8);
-                    ip[ihl] = 0;
-                    ip[ihl + 2..ihl + 4].fill(0);
-                    let sum = checksum(&ip[ihl..]);
-                    ip[ihl + 2..ihl + 4].copy_from_slice(&sum.to_be_bytes());
+                if ip[9] == 17 && ip[ihl + 6..ihl + 8] != [0, 0] {
+                    assert_eq!(
+                        l4_checksum(ip),
+                        0,
+                        "TUN segmentation must complete UDP checksum"
+                    );
                 }
-                17 => {
-                    ip.swap(ihl, ihl + 2);
-                    ip.swap(ihl + 1, ihl + 3);
-                    ip[ihl + 6..ihl + 8].fill(0);
-                    // Valid nonzero checksums allow the client's TUN GRO path
-                    // to combine the burst before delivery to the application.
-                    let sum = l4_checksum(ip);
-                    ip[ihl + 6..ihl + 8]
-                        .copy_from_slice(&if sum == 0 { u16::MAX } else { sum }.to_be_bytes());
+                for i in 0..4 {
+                    ip.swap(12 + i, 16 + i);
                 }
-                p => panic!("unexpected protocol {p}"),
+                match ip[9] {
+                    1 => {
+                        assert_eq!(ip[ihl], 8);
+                        ip[ihl] = 0;
+                        ip[ihl + 2..ihl + 4].fill(0);
+                        let sum = checksum(&ip[ihl..]);
+                        ip[ihl + 2..ihl + 4].copy_from_slice(&sum.to_be_bytes());
+                    }
+                    17 => {
+                        ip.swap(ihl, ihl + 2);
+                        ip.swap(ihl + 1, ihl + 3);
+                        ip[ihl + 6..ihl + 8].fill(0);
+                        // Valid nonzero checksums allow the client's TUN GRO path
+                        // to combine the burst before delivery to the application.
+                        let sum = l4_checksum(ip);
+                        ip[ihl + 6..ihl + 8]
+                            .copy_from_slice(&if sum == 0 { u16::MAX } else { sum }.to_be_bytes());
+                    }
+                    p => panic!("unexpected protocol {p}"),
+                }
+                ip[10..12].fill(0);
+                let sum = checksum(&ip[..ihl]);
+                ip[10..12].copy_from_slice(&sum.to_be_bytes());
             }
-            ip[10..12].fill(0);
-            let sum = checksum(&ip[..ihl]);
-            ip[10..12].copy_from_slice(&sum.to_be_bytes());
         }
         nonce += 1;
         wire::seal(&key, nonce, opened.typ, 7, &mut buf[..len]);
@@ -415,4 +531,12 @@ fn echo_peer() {
             socket.send_to(&buf[..len], from).unwrap();
         }
     }
+}
+
+fn l4_checksum6(ip: &[u8]) -> u16 {
+    let mut pseudo = ip[8..40].to_vec();
+    pseudo.extend(((ip.len() - 40) as u32).to_be_bytes());
+    pseudo.extend([0, 0, 0, ip[6]]);
+    pseudo.extend(&ip[40..]);
+    checksum(&pseudo)
 }

@@ -109,6 +109,59 @@ fn keepalive(gen_path: &Path) {
     assert_eq!(result.data_size_out, 60);
 }
 
+fn keepalive6(gen_path: &Path) {
+    let cfg = Array::<_, Config>::try_from(Map::Array(
+        MapData::from_pin(gen_path.join("CONFIG")).unwrap(),
+    ))
+    .unwrap()
+    .get(&0, 0)
+    .unwrap();
+    let prog = Xdp::from_pin(gen_path.join("program"), XdpAttachType::Interface).unwrap();
+    let mut data = [0u8; 70];
+    data[..14].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x86, 0xdd]);
+    let ip = &mut data[14..];
+    ip[0] = 0x60;
+    ip[4..6].copy_from_slice(&16u16.to_be_bytes());
+    ip[6] = 17;
+    ip[7] = 64;
+    ip[8..24].copy_from_slice(
+        &"2001:db8:1::7"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    );
+    ip[24..40].copy_from_slice(&cfg.server_ip6);
+    ip[40..42].copy_from_slice(&40000u16.to_be_bytes());
+    ip[42..44].copy_from_slice(&cfg.port_be.to_ne_bytes());
+    ip[44..46].copy_from_slice(&16u16.to_be_bytes());
+    wire::seal(
+        &wire::Key {
+            k0: cfg.key0,
+            k1: cfg.key1,
+        },
+        42,
+        wire::TYPE_KEEPALIVE,
+        7,
+        &mut ip[48..],
+    );
+    let mut pseudo = ip[8..40].to_vec();
+    pseudo.extend([0, 0, 0, 16, 0, 0, 0, 17]);
+    pseudo.extend(&ip[40..]);
+    let sum = checksum(&pseudo);
+    ip[46..48].copy_from_slice(&if sum == 0 { 0xffff } else { sum }.to_be_bytes());
+    let mut output = [0; 128];
+    let result = prog
+        .test_run(TestRunOptions {
+            data_in: Some(&data),
+            data_out: Some(&mut output),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(result.return_value, 3);
+    assert_eq!(result.data_size_out, 70);
+    assert_eq!(&output[22..38], &cfg.server_ip6);
+}
+
 // The outer process creates disposable mount and network namespaces. Even a
 // failed assertion cannot leave links, mounts or interfaces in the host netns.
 #[test]
@@ -162,7 +215,10 @@ fn isolated_lifecycle() {
     }
     let _cleanup = Cleanup(temp.clone());
     let config = temp.join("server.toml");
-    let original = include_str!("../../config/server.example.toml").replace("eth0", "edup-test0");
+    let original = format!(
+        "{}\nserver_ip6 = \"2001:db8::1\"\nnat_ip6 = \"2001:db8::1\"\ntunnel_net6 = \"fd66::/112\"\n",
+        include_str!("../../config/server.example.toml").replace("eth0", "edup-test0")
+    );
     fs::write(&config, &original).unwrap();
     server(&config, "check", true);
     server(&config, "up", true);
@@ -172,7 +228,9 @@ fn isolated_lifecycle() {
     assert!(!link_state.contains("xdpgeneric"), "{link_state}");
     keepalive(&first);
     assert!(server(&temp.join("missing"), "users", true).contains("198.51.100.7:40000"));
-    assert!(server(&temp.join("missing"), "stats", true).contains("keepalive 1"));
+    keepalive6(&first);
+    assert!(server(&temp.join("missing"), "users", true).contains("[2001:db8:1::7]:40000"));
+    assert!(server(&temp.join("missing"), "stats", true).contains("keepalive 2"));
     // Repeated up and a second instance may not replace an existing attachment.
     server(&config, "up", false);
     let second = "/sys/fs/bpf/edup-other";
@@ -200,7 +258,7 @@ fn isolated_lifecycle() {
         fs::write(&config, bad).unwrap();
         server(&config, "reload", false);
         assert_eq!(generation(), first);
-        assert!(server(&config, "stats", true).contains("keepalive 1"));
+        assert!(server(&config, "stats", true).contains("keepalive 2"));
     }
     fs::write(&config, &original).unwrap();
     let socket = std::net::UdpSocket::bind(("0.0.0.0", 20001)).unwrap();
@@ -213,7 +271,7 @@ fn isolated_lifecycle() {
         inner_ip_be: u32::from_ne_bytes([10, 66, 0, 7]),
         inner_port_be: 1234u16.to_be(),
         proto: 17,
-        _pad: 0,
+        v6: 0,
     };
     HashMap::<_, NatOutKey, NatOutVal>::try_from(Map::LruHashMap(
         MapData::from_pin(first.join("NAT_OUT")).unwrap(),
@@ -236,7 +294,7 @@ fn isolated_lifecycle() {
         NatInKey {
             pub_port_be: 20000u16.to_be(),
             proto: 17,
-            _pad: 0,
+            v6: 0,
         },
         NatInVal {
             inner_ip_be: forward.inner_ip_be,
@@ -285,6 +343,8 @@ fn isolated_lifecycle() {
             .unwrap();
     assert_eq!(users_map.get(&42, 0).unwrap().enabled, 0);
     drop(users_map);
+    keepalive6(&active);
+    assert!(server(&config, "stats", true).contains("keepalive 1"));
 
     server(&temp.join("missing"), "down", true);
     assert!(!Path::new(PIN).exists());
@@ -299,6 +359,7 @@ fn isolated_lifecycle() {
     .unwrap();
     server(&config, "up", true);
     keepalive(&generation());
+    keepalive6(&generation());
     server(&config, "down", true);
     println!(
         "PASS: native/generic attach, pin lifetime, packet/maps, reload/reset, failure preservation, exclusive attach, down/idempotence"

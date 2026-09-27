@@ -16,7 +16,7 @@ impl Routes {
         physical: &PhysicalRoute,
         interface: &str,
         index: u32,
-        server: std::net::Ipv4Addr,
+        server: std::net::IpAddr,
     ) -> Result<Self> {
         let mut guard = Self {
             created: Vec::new(),

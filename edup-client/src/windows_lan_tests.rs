@@ -24,7 +24,7 @@ fn lan_roundtrip() -> Result<()> {
     ps(
         "if (@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object DestinationPrefix -eq '198.18.0.1/32').Count) {throw 'test destination already has a host route'}",
     );
-    let physical = routes::PhysicalRoute::discover(*cfg.server.ip())?;
+    let physical = routes::PhysicalRoute::discover(cfg.server.ip())?;
     let raw = UdpSocket::bind((physical.source(), 0))?;
     raw.connect(cfg.server)?;
     raw.set_read_timeout(Some(Duration::from_millis(200)))?;
