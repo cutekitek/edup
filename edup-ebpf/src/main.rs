@@ -129,10 +129,16 @@ fn from_internet(ctx: &XdpContext, cfg: &Config, ip: &Ip) -> Result<u32, u32> {
 // Inlining lets the compiler reuse scratch slots instead of adding a live
 // nested frame to the inbound path on kernels with the 512-byte stack limit.
 #[inline(always)]
-fn xor(ctx: &XdpContext, offset: usize, len: usize, seed: u64) -> Result<(), u32> {
+fn xor<const CHECKSUM: bool>(
+    ctx: &XdpContext,
+    offset: usize,
+    len: usize,
+    seed: u64,
+) -> Result<u64, u32> {
     if len > wire::MAX_KS_WORDS as usize * 8 {
         return Err(stat::DROP_TOO_BIG);
     }
+    let mut sum = 0;
     for word in 0..wire::MAX_KS_WORDS {
         let base = word as usize * 8;
         if base + 8 > len {
@@ -140,7 +146,14 @@ fn xor(ctx: &XdpContext, offset: usize, len: usize, seed: u64) -> Result<(), u32
         }
         let key = wire::ks_word(seed, word);
         let pos = offset + base;
-        write(ctx, pos, read::<u64>(ctx, pos)? ^ key.to_le())?;
+        let value = read::<u64>(ctx, pos)? ^ key.to_le();
+        write(ctx, pos, value)?;
+        if CHECKSUM {
+            sum += (value & 0xffff)
+                + ((value >> 16) & 0xffff)
+                + ((value >> 32) & 0xffff)
+                + (value >> 48);
+        }
     }
     let full = len / 8;
     let key = wire::ks_word(seed, full as u32);
@@ -149,9 +162,31 @@ fn xor(ctx: &XdpContext, offset: usize, len: usize, seed: u64) -> Result<(), u32
             break;
         }
         let pos = offset + full * 8 + byte;
-        write(ctx, pos, read::<u8>(ctx, pos)? ^ (key >> (byte * 8)) as u8)?;
+        let value = read::<u8>(ctx, pos)? ^ (key >> (byte * 8)) as u8;
+        write(ctx, pos, value)?;
+        if CHECKSUM {
+            // Native little-endian checksum words, including zero-padded odd tail.
+            sum += (value as u64) << ((byte & 1) * 8);
+        }
     }
-    Ok(())
+    Ok(sum)
+}
+
+/// Complete the UDP checksum over the ciphertext, UDP header and IPv4 pseudo
+/// header. Nonzero outer checksums allow the receiving stack to use UDP GRO/URO.
+/// Ciphertext's sum is accumulated during XOR, avoiding another packet walk.
+#[inline(always)]
+fn finish_outer_checksum(ctx: &XdpContext, len: usize, mut sum: u64) -> Result<(), u32> {
+    for word in 0..4 {
+        sum += read::<u16>(ctx, ETH + 12 + word * 2)? as u64;
+    }
+    // UDP header (checksum is still zero) and plaintext nonce.
+    for word in 0..6 {
+        sum += read::<u16>(ctx, ETH + 20 + word * 2)? as u64;
+    }
+    sum += (IPPROTO_UDP as u16).to_be() as u64 + ((len - 20) as u16).to_be() as u64;
+    let check = !csum::fold(sum);
+    write(ctx, ETH + 26, if check == 0 { 0xffff } else { check })
 }
 
 #[inline(always)]
@@ -231,10 +266,16 @@ fn from_client(ctx: &XdpContext, cfg: &Config, outer: &Ip) -> Result<u32, u32> {
             port,
         )?;
         write(ctx, 0, mac)?;
+        let ciphertext = read::<u32>(ctx, ETH + 32)?;
+        finish_outer_checksum(
+            ctx,
+            outer.len,
+            (ciphertext & 0xffff) as u64 + (ciphertext >> 16) as u64,
+        )?;
         count(stat::KEEPALIVE);
         return Ok(xdp_action::XDP_TX);
     }
-    xor(ctx, ETH + 32, outer.len - 32, seed)?;
+    xor::<false>(ctx, ETH + 32, outer.len - 32, seed)?;
     let inner = ipv4(ctx, ETH + wire::OVERHEAD_V4).map_err(|_| stat::DROP_BAD_INNER)?;
     if inner.len + wire::OVERHEAD_V4 != outer.len {
         return Err(stat::DROP_BAD_INNER);
@@ -320,7 +361,7 @@ fn to_client(
         ETH + 32,
         wire::hdr_word(wire::TYPE_DATA, mapping.user).to_le(),
     )?;
-    xor(
+    let sum = xor::<true>(
         ctx,
         ETH + 32,
         ip.len + 4,
@@ -332,6 +373,7 @@ fn to_client(
             nonce,
         ),
     )?;
+    finish_outer_checksum(ctx, len, sum)?;
     count(stat::TX_TUNNEL);
     Ok(xdp_action::XDP_TX)
 }
@@ -362,7 +404,7 @@ fn write_outer(
     write(ctx, ETH + 20, sport)?;
     write(ctx, ETH + 22, dport)?;
     write(ctx, ETH + 24, ((len - 20) as u16).to_be())?;
-    // An absent UDP checksum is explicitly allowed for outer IPv4.
+    // Completed after sealing (or preserving the KEEPALIVE ciphertext).
     write(ctx, ETH + 26, 0u16)
 }
 

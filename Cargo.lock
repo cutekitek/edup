@@ -402,6 +402,7 @@ dependencies = [
  "socket2",
  "toml",
  "tun-rs",
+ "windows-sys",
 ]
 
 [[package]]

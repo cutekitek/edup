@@ -4,6 +4,7 @@ use edup_common::{key::derive_key, wire};
 use std::{
     fs,
     net::UdpSocket,
+    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -156,6 +157,19 @@ fn isolated_client() {
     let mut reply = [0u8; 1500];
     let len = udp.recv(&mut reply).unwrap();
     assert_eq!(&reply[..len], &payload);
+    // One real UDP GSO packet from the application crosses TUN segmentation,
+    // independent wire sealing, outer UDP segmentation, GRO and TUN injection.
+    let mut burst = vec![0x6b; 32 * 1000];
+    for (i, p) in burst.chunks_mut(1000).enumerate() {
+        p[1] = i as u8;
+    }
+    segment_size(&udp, 1000);
+    assert_eq!(udp.send(&burst).unwrap(), burst.len());
+    segment_size(&udp, 0);
+    for p in burst.chunks(1000) {
+        let len = udp.recv(&mut reply).unwrap();
+        assert_eq!(&reply[..len], p);
+    }
     wait_for(|| {
         fs::read_to_string(dir.join("keepalives"))
             .ok()
@@ -167,7 +181,12 @@ fn isolated_client() {
     assert_clean();
     assert!(ip(&["route", "show", "exact", "192.0.2.1/32"]).is_empty());
     let log = fs::read_to_string(dir.join("client.log")).unwrap();
-    assert!(log.contains("tx=3 rx=3"), "{log}");
+    assert!(log.contains("tx=35 rx=35"), "{log}");
+    assert!(log.contains("TUN offload: tcp=true, udp=true"), "{log}");
+    assert!(!log.contains("udp_coalesced_receives=0"), "{log}");
+    assert!(!log.contains("udp_segmented_sends=0"), "{log}");
+    assert!(!log.contains("tun_segmented_reads=0"), "{log}");
+    assert!(!log.contains("tun_coalesced_writes=0"), "{log}");
     let dropped: u64 = log
         .split_whitespace()
         .find_map(|s| s.strip_prefix("dropped="))
@@ -205,8 +224,18 @@ fn isolated_client() {
         "metric",
         "123",
     ]);
+    // The same binary must still operate with all offloads explicitly disabled.
+    let path = dir.join("client.toml");
+    fs::write(
+        &path,
+        fs::read_to_string(&path)
+            .unwrap()
+            .replace("offload = true", "offload = false"),
+    )
+    .unwrap();
     let mut second = client(&dir);
     started(&dir, &mut second);
+    checked("ping", &["-n", "-c", "1", "-W", "3", "203.0.113.9"]);
     stop(&mut second);
     assert_clean();
     assert!(ip(&["route", "show", "exact", "192.0.2.1/32"]).contains("metric 123"));
@@ -248,6 +277,32 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+fn segment_size(socket: &UdpSocket, size: libc::c_int) {
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_UDP,
+                libc::UDP_SEGMENT,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as _,
+            )
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn l4_checksum(ip: &[u8]) -> u16 {
+    let ihl = usize::from(ip[0] & 15) * 4;
+    let mut pseudo = ip[12..20].to_vec();
+    pseudo.extend([0, ip[9]]);
+    pseudo.extend(((ip.len() - ihl) as u16).to_be_bytes());
+    pseudo.extend(&ip[ihl..]);
+    checksum(&pseudo)
+}
+
 #[test]
 #[ignore = "helper for isolated_client"]
 fn echo_peer() {
@@ -274,6 +329,8 @@ fn echo_peer() {
     let mut buf = [0u8; 2048];
     let mut keepalives = 0;
     let mut injected = false;
+    let mut burst_reply = Vec::new();
+    let mut nonce = 10;
     while !dir.join("stop").exists() {
         let (len, from) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
@@ -289,6 +346,9 @@ fn echo_peer() {
         };
         let opened = wire::open(&key, &mut buf[..len]).unwrap();
         assert_eq!(opened.user, 7);
+        let burst = opened.typ == wire::TYPE_DATA
+            && len == wire::HDR_LEN + 20 + 8 + 1000
+            && buf[wire::HDR_LEN + 28] == 0x6b;
         if opened.typ == wire::TYPE_KEEPALIVE {
             keepalives += 1;
             fs::write(dir.join("keepalives"), keepalives.to_string()).unwrap();
@@ -302,6 +362,18 @@ fn echo_peer() {
         } else {
             let ip = &mut buf[wire::HDR_LEN..len];
             let ihl = usize::from(ip[0] & 15) * 4;
+            assert_eq!(
+                checksum(&ip[..ihl]),
+                0,
+                "TUN segmentation must complete IPv4 checksum"
+            );
+            if ip[9] == 17 && ip[ihl + 6..ihl + 8] != [0, 0] {
+                assert_eq!(
+                    l4_checksum(ip),
+                    0,
+                    "TUN segmentation must complete UDP checksum"
+                );
+            }
             for i in 0..4 {
                 ip.swap(12 + i, 16 + i);
             }
@@ -316,7 +388,12 @@ fn echo_peer() {
                 17 => {
                     ip.swap(ihl, ihl + 2);
                     ip.swap(ihl + 1, ihl + 3);
-                    ip[ihl + 6..ihl + 8].fill(0); // IPv4 permits UDP without a checksum.
+                    ip[ihl + 6..ihl + 8].fill(0);
+                    // Valid nonzero checksums allow the client's TUN GRO path
+                    // to combine the burst before delivery to the application.
+                    let sum = l4_checksum(ip);
+                    ip[ihl + 6..ihl + 8]
+                        .copy_from_slice(&if sum == 0 { u16::MAX } else { sum }.to_be_bytes());
                 }
                 p => panic!("unexpected protocol {p}"),
             }
@@ -324,7 +401,18 @@ fn echo_peer() {
             let sum = checksum(&ip[..ihl]);
             ip[10..12].copy_from_slice(&sum.to_be_bytes());
         }
-        wire::seal(&key, 10, opened.typ, 7, &mut buf[..len]);
-        socket.send_to(&buf[..len], from).unwrap();
+        nonce += 1;
+        wire::seal(&key, nonce, opened.typ, 7, &mut buf[..len]);
+        if burst {
+            burst_reply.extend_from_slice(&buf[..len]);
+            if burst_reply.len() == 32 * len {
+                segment_size(&socket, len as libc::c_int);
+                socket.send_to(&burst_reply, from).unwrap();
+                segment_size(&socket, 0);
+                burst_reply.clear();
+            }
+        } else {
+            socket.send_to(&buf[..len], from).unwrap();
+        }
     }
 }

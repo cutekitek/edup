@@ -6,5 +6,7 @@ interface = "edup0"
 mtu = 1464
 keepalive_secs = 15
 routes = true
+# Opportunistic Linux GSO/GRO, Windows USO/URO; false uses ordinary packets.
+offload = true
 # Windows: by default wintun.dll is loaded beside edup-client.exe.
 # wintun_dll = 'C:\Program Files\edup\wintun.dll'

@@ -21,6 +21,9 @@ pub struct Settings {
     pub keepalive_secs: u64,
     #[serde(default = "routes")]
     pub routes: bool,
+    /// Opportunistic UDP segmentation/coalescing (GSO/GRO or USO/URO).
+    #[serde(default = "offload")]
+    pub offload: bool,
     /// Windows: absolute DLL path. Default is beside the executable, never CWD.
     pub wintun_dll: Option<PathBuf>,
 }
@@ -34,6 +37,9 @@ fn keepalive() -> u64 {
     15
 }
 fn routes() -> bool {
+    true
+}
+fn offload() -> bool {
     true
 }
 
@@ -128,6 +134,18 @@ mod tests {
         c.validate().unwrap();
         assert_eq!(c.address().unwrap(), Ipv4Addr::new(10, 66, 0, 7));
         assert_eq!(c.mtu, 1464);
+        assert!(c.offload);
+        let legacy: Settings = toml::from_str(
+            &include_str!("../../config/client.example.toml").replace("offload = true", ""),
+        )
+        .unwrap();
+        assert!(legacy.offload);
+        let disabled: Settings = toml::from_str(
+            &include_str!("../../config/client.example.toml")
+                .replace("offload = true", "offload = false"),
+        )
+        .unwrap();
+        assert!(!disabled.offload);
     }
     #[test]
     fn invalid_configuration() {

@@ -146,6 +146,14 @@ fn run(bpf: &Ebpf, input: &[u8], action: u32) -> Result<Vec<u8>, Error> {
             "padding must be zero"
         );
         out.truncate(ip_end);
+        if out[ETH + 9] == IPPROTO_UDP && get16(&out, ETH + 20) == 7777 {
+            assert_ne!(
+                get16(&out, ETH + 26),
+                0,
+                "outer UDP checksum required for receive offload"
+            );
+            verify_ip(&out[ETH..]);
+        }
     }
     Ok(out)
 }
@@ -233,6 +241,24 @@ fn main() -> Result<(), Error> {
             1234
         );
         println!("PASS: protocol {proto} SNAT/DNAT, checksums, TTL, EIM, wire compatibility");
+        if proto == IPPROTO_UDP {
+            let extended = Config {
+                max_frame: (wire::MAX_KS_WORDS * 8 + 32) as u16,
+                ..cfg
+            };
+            Array::<_, Config>::try_from(bpf.map_mut("CONFIG").unwrap())?.set(0, extended, 0)?;
+            // Every ciphertext tail length, plus both edges of the maximum
+            // allowed packet. XDP's output checksum covers encrypted bytes.
+            for payload in (0..16).chain([1435, 1436, 1503, 1504]) {
+                let reply = transport(proto, REMOTE, SERVER, 443, public, payload);
+                let received = run(&bpf, &frame(&reply), 3)?;
+                let mut data = received[42..].to_vec();
+                wire::open(&KEY, &mut data).unwrap();
+                verify_ip(&data[wire::HDR_LEN..]);
+            }
+            Array::<_, Config>::try_from(bpf.map_mut("CONFIG").unwrap())?.set(0, cfg, 0)?;
+            println!("PASS: nonzero outer UDP checksums, all XOR tails and maximum wire size");
+        }
     }
 
     let inner = transport(IPPROTO_UDP, INNER, REMOTE, 1234, 443, 10);

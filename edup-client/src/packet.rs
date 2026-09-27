@@ -1,4 +1,5 @@
-//! Validate before touching packet fields. Offloads and fragmented IPv4 are not supported.
+//! Validate segmented, checksum-complete IP packets before touching fields.
+//! Fragmented IPv4 is not supported.
 use edup_common::csum;
 
 pub fn validate(ip: &[u8], address: [u8; 4], outbound: bool, mtu: u16) -> Option<usize> {
