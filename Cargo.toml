@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["edup-common", "edup-ebpf", "edup-server", "edup-client"]
+default-members = ["edup-common", "edup-server", "edup-client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+edup-common = { path = "edup-common", default-features = false }
+
+aya = { version = "0.14", default-features = false }
+aya-build = "0.2"
+aya-ebpf = "0.2.1"
+
+anyhow = "1"
+blake2 = "0.11"
+clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+tun-rs = "2.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.release.package.edup-ebpf]
+debug = 2
+codegen-units = 1

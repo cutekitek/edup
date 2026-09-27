@@ -1,0 +1,12 @@
+interface = "eth0"
+server_ip = "192.0.2.1"
+nat_ip = "192.0.2.1"
+port = 7777
+password = "replace-this-password"
+tunnel_net = "10.66.0.0/16"
+nat_port_min = 20000
+nat_port_max = 29999
+max_frame = 1500
+# "driver" is native XDP. "skb" must be selected explicitly for diagnostics.
+xdp_mode = "driver"
+users = [7, 42]

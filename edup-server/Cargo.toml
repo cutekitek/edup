@@ -1,0 +1,23 @@
+[package]
+name = "edup-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+edup-common = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+libc.workspace = true
+edup-common = { workspace = true, features = ["aya"] }
+
+[build-dependencies]
+aya-build.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aya-obj = "0.3"

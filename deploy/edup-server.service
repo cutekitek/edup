@@ -1,0 +1,24 @@
+[Unit]
+Description=edup XDP tunnel loader
+Wants=network-online.target
+Requires=edup-bpffs.service
+After=network-online.target edup-bpffs.service
+RequiresMountsFor=/sys/fs/bpf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/edup-server --config /etc/edup/server.toml up
+ExecReload=/usr/local/sbin/edup-server --config /etc/edup/server.toml reload
+ExecStop=/usr/local/sbin/edup-server down
+User=root
+Group=root
+UMask=0077
+LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/fs/bpf /run
+
+[Install]
+WantedBy=multi-user.target

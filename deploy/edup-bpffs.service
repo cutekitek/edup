@@ -1,0 +1,9 @@
+[Unit]
+Description=Mount BPF filesystem for edup
+Before=edup-server.service
+ConditionPathIsMountPoint=!/sys/fs/bpf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/mount -t bpf -o mode=700 bpf /sys/fs/bpf
