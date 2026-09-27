@@ -83,9 +83,17 @@ pub const fn parse_hdr_word(w: u32) -> Option<(u8, u8, u16)> {
 /// XOR области (всё после nonce) с потоком ключа. Операция обратима.
 pub fn xor_region(key: &Key, nonce: u32, region: &mut [u8]) {
     let seed = ks_seed(key, nonce);
-    for (i, chunk) in region.chunks_mut(8).enumerate() {
-        let ks = ks_word(seed, i as u32).to_le_bytes();
-        for (b, k) in chunk.iter_mut().zip(ks) {
+    let (chunks, tail) = region.as_chunks_mut::<8>();
+    let full = chunks.len();
+    for (i, chunk) in chunks.iter_mut().enumerate() {
+        // Fixed-size loads let LLVM use a word XOR instead of a partial-byte
+        // loop. Byte-array loads/stores also work on unaligned buffers.
+        let value = u64::from_le_bytes(*chunk);
+        *chunk = (value ^ ks_word(seed, i as u32)).to_le_bytes();
+    }
+    if !tail.is_empty() {
+        let ks = ks_word(seed, full as u32).to_le_bytes();
+        for (b, k) in tail.iter_mut().zip(ks) {
             *b ^= k;
         }
     }
@@ -130,6 +138,25 @@ mod tests {
         k0: 0x0123_4567_89ab_cdef,
         k1: 0xfedc_ba98_7654_3210,
     };
+
+    #[test]
+    fn word_xor_matches_original_wire_at_every_length_and_alignment() {
+        // A roundtrip alone could hide a change made to both seal and open.
+        // Compare against the original byte implementation, including tails.
+        for offset in 0..8 {
+            for len in 0..=MAX_KS_WORDS as usize * 8 {
+                let mut actual = [0xa5; MAX_KS_WORDS as usize * 8 + 16];
+                let mut expected = actual;
+                let nonce = (len as u32).wrapping_mul(0x9e3779b9) ^ offset as u32;
+                let seed = ks_seed(&KEY, nonce);
+                for (i, b) in expected[offset..offset + len].iter_mut().enumerate() {
+                    *b ^= (ks_word(seed, (i / 8) as u32) >> ((i % 8) * 8)) as u8;
+                }
+                xor_region(&KEY, nonce, &mut actual[offset..offset + len]);
+                assert_eq!(actual, expected, "offset={offset}, len={len}");
+            }
+        }
+    }
 
     #[test]
     fn seal_open_roundtrip() {

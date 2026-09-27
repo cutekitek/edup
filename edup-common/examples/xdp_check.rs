@@ -178,6 +178,9 @@ fn main() -> Result<(), Error> {
         },
         0,
     )?;
+    if std::env::args().nth(2).as_deref() == Some("--bench") {
+        return benchmark(&bpf);
+    }
     let keepalive = tunnel(&[], wire::TYPE_KEEPALIVE, 7);
     let mut padded = keepalive.clone();
     padded.resize(60, 0xff);
@@ -497,5 +500,57 @@ fn main() -> Result<(), Error> {
         }
     }
     println!("All XDP integration checks passed; nothing attached or pinned.");
+    Ok(())
+}
+
+// Repeat separate syscalls: XDP modifies the input in place, so kernel repeat>1
+// can time a different path after the first iteration. No program is attached.
+fn benchmark(bpf: &Ebpf) -> Result<(), Error> {
+    let program: &Xdp = bpf.program("edup").unwrap().try_into()?;
+    for payload in [0, 1360] {
+        let mut inner = transport(IPPROTO_TCP, INNER, REMOTE, 1234, 443, payload);
+        inner[33] = 0x10; // established ACK; no state transition in the hot path
+        put16(&mut inner, 36, 0);
+        let sum = checksum(&pseudo(&inner));
+        put16(&mut inner, 36, sum);
+        let outbound = tunnel(&inner, wire::TYPE_DATA, 7);
+        let sent = run(bpf, &outbound, 3)?;
+        let public = get16(&sent, ETH + 20);
+        let mut reply = transport(IPPROTO_TCP, REMOTE, SERVER, 443, public, payload);
+        reply[33] = 0x10;
+        put16(&mut reply, 36, 0);
+        let sum = checksum(&pseudo(&reply));
+        put16(&mut reply, 36, sum);
+        let inbound = frame(&reply);
+        for (direction, input) in [("outbound", &outbound), ("inbound", &inbound)] {
+            let mut out = [0; 2048];
+            let mut samples = Vec::new();
+            for round in 0..8 {
+                let mut total = 0u128;
+                for _ in 0..2000 {
+                    let result = program.test_run(TestRunOptions {
+                        data_in: Some(input),
+                        data_out: Some(&mut out),
+                        repeat: 1,
+                        ..Default::default()
+                    })?;
+                    assert_eq!(
+                        result.return_value, 3,
+                        "benchmark must forward every packet"
+                    );
+                    total += result.duration.as_nanos();
+                }
+                if round != 0 {
+                    samples.push(total as f64 / 2000.0);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "BENCH {direction} inner_bytes={} median_ns={:.1}",
+                inner.len(),
+                samples[3]
+            );
+        }
+    }
     Ok(())
 }

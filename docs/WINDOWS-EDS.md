@@ -2,7 +2,7 @@
 
 The server is deployed at **45.151.73.43:7777 (UDP)**. The ready-to-run Windows
 x64 package is `local/edup-windows-eds.zip`; its unpacked copy is at
-`C:\projects\edup\local\windows-client-eds`.
+`C:\projects\edup\local\windows-client-eds-optimized`.
 
 The package includes the current client, Wintun DLL and license, and a matching
 `client.toml` with a separate generated password. Keep this configuration private.
@@ -14,7 +14,7 @@ Stop the old edup client with **Ctrl+C** and disable other VPN TUN modes before
 switching. Open **PowerShell as Administrator**, then run:
 
 ```powershell
-Set-Location C:\projects\edup\local\windows-client-eds
+Set-Location C:\projects\edup\local\windows-client-eds-optimized
 .\edup-client.exe --config .\client.toml check
 .\edup-client.exe --config .\client.toml run
 ```

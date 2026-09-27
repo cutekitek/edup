@@ -49,17 +49,24 @@ fn owner(v: &NatInVal, key: &NatOutKey, user: u16) -> bool {
 
 #[inline(always)]
 fn touch(key: &NatInKey, v: &NatInVal, flags: u8, now: u64) {
+    let next_state = state(key.proto, v.state, flags);
+    let refresh = now.saturating_sub(v.last_seen_ns) >= TOUCH_INTERVAL_NS;
+    // Most established packets change neither field. Avoid another hash map
+    // lookup and a shared cache-line write on that hot path. Ownership checks
+    // in the caller still run for every packet.
+    if !refresh && next_state == v.state {
+        return;
+    }
     if let Some(ptr) = NAT_IN.get_ptr_mut(key) {
         unsafe {
             // Expiration claims last_seen=0. A racing touch must not resurrect it.
             let timestamp = core::ptr::addr_of_mut!((*ptr).last_seen_ns);
-            if now.saturating_sub(v.last_seen_ns) >= TOUCH_INTERVAL_NS {
+            if refresh {
                 let _ = compare_exchange(timestamp, v.last_seen_ns, now);
             }
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!((*ptr).state),
-                state(key.proto, v.state, flags),
-            );
+            if next_state != v.state {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).state), next_state);
+            }
         }
     }
 }
