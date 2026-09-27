@@ -1,7 +1,7 @@
 use super::*;
 use std::{os::windows::process::CommandExt, process::Command};
 
-fn ps(script: &str) {
+pub(super) fn ps(script: &str) {
     let out = Command::new("powershell.exe")
         .args([
             "-NoProfile",

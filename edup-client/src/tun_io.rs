@@ -9,7 +9,10 @@ use std::io;
 use std::time::Duration;
 use tun_rs::{InterruptEvent, SyncDevice};
 
+#[cfg(target_os = "linux")]
 pub const BATCH_SIZE: usize = 128;
+#[cfg(target_os = "windows")]
+const BATCH_SIZE: usize = 1;
 pub struct Reader {
     pub packets: Vec<Vec<u8>>,
     pub sizes: Vec<usize>,
@@ -87,27 +90,21 @@ impl Reader {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub struct Writer {
-    #[cfg(target_os = "linux")]
     gro: tun_rs::GROTable,
     packets: Vec<Vec<u8>>,
     count: usize,
     pub coalesced_writes: u64,
 }
+#[cfg(target_os = "linux")]
 impl Writer {
     pub fn new() -> Self {
         Self {
-            #[cfg(target_os = "linux")]
             gro: tun_rs::GROTable::default(),
             // tun-rs only coalesces into existing capacity (no reallocations).
             packets: (0..BATCH_SIZE)
-                .map(|_| {
-                    Vec::with_capacity(if cfg!(target_os = "linux") {
-                        udp::RECEIVE_CAPACITY + 16
-                    } else {
-                        2048
-                    })
-                })
+                .map(|_| Vec::with_capacity(udp::RECEIVE_CAPACITY + 16))
                 .collect(),
             count: 0,
             coalesced_writes: 0,
@@ -117,7 +114,6 @@ impl Writer {
         assert!(self.count < BATCH_SIZE);
         let p = &mut self.packets[self.count];
         p.clear();
-        #[cfg(target_os = "linux")]
         p.resize(tun_rs::VIRTIO_NET_HDR_LEN, 0);
         p.extend_from_slice(packet);
         self.count += 1;
@@ -130,7 +126,6 @@ impl Writer {
         if count == 0 {
             return Ok((0, 0));
         }
-        #[cfg(target_os = "linux")]
         {
             let original_bytes: usize = self.packets[..count].iter().map(Vec::len).sum();
             match tun.send_multiple_intr(
@@ -150,19 +145,6 @@ impl Writer {
                 Err(e) if crate::temporary(&e) => Ok((0, count as u64)),
                 Err(e) => Err(e),
             }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let (mut sent, mut dropped) = (0, 0);
-            for p in &self.packets[..count] {
-                match tun.send_intr(p, event) {
-                    Ok(n) if n == p.len() => sent += 1,
-                    Ok(_) => return Err(io::Error::other("partial TUN packet")),
-                    Err(e) if crate::temporary(&e) => dropped += 1,
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok((sent, dropped))
         }
     }
 }

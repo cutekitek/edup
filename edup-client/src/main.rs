@@ -3,6 +3,8 @@ mod packet;
 mod routes;
 mod tun_io;
 mod udp;
+#[cfg(target_os = "windows")]
+mod windows_delivery;
 
 #[cfg(target_os = "windows")]
 use anyhow::ensure;
@@ -47,6 +49,8 @@ struct Counters {
     keepalive_received: AtomicU64,
     tun_segmented_reads: AtomicU64,
     tun_coalesced_writes: AtomicU64,
+    #[cfg(target_os = "windows")]
+    tun_backpressure_drops: AtomicU64,
 }
 impl Counters {
     fn report(&self) {
@@ -59,6 +63,11 @@ impl Counters {
             self.keepalive_received.load(Relaxed),
             self.tun_segmented_reads.load(Relaxed),
             self.tun_coalesced_writes.load(Relaxed)
+        );
+        #[cfg(target_os = "windows")]
+        eprintln!(
+            "tun_backpressure_drops={}",
+            self.tun_backpressure_drops.load(Relaxed)
         );
     }
 }
@@ -204,6 +213,9 @@ fn create_device(cfg: &config::Settings) -> Result<SyncDevice> {
 #[cfg(all(test, target_os = "windows"))]
 mod windows_tests;
 
+#[cfg(all(test, target_os = "windows"))]
+mod windows_lan_tests;
+
 #[allow(clippy::too_many_arguments)]
 fn send_loop(
     tun: &SyncDevice,
@@ -305,6 +317,9 @@ fn receive_loop(
     event: &InterruptEvent,
 ) -> Result<()> {
     let mut buf = vec![0; udp::RECEIVE_CAPACITY];
+    #[cfg(target_os = "windows")]
+    let _ = event;
+    #[cfg(target_os = "linux")]
     let mut writer = tun_io::Writer::new();
     let address = cfg.address()?.octets();
     let mut next = Instant::now();
@@ -347,22 +362,58 @@ fn receive_loop(
             counts.dropped.fetch_add(1, Relaxed);
             continue;
         }
+        #[cfg(target_os = "windows")]
+        let (mut delivered, mut dropped, mut congested) = (0, 0, 0);
         for data in buf[..len].chunks_mut(stride) {
             if stop.load(Relaxed) {
                 break;
             }
             if let Some(payload) = decode_packet(data, cfg, key, address, counts) {
-                writer.push(payload);
-                if writer.full() {
-                    flush_tun(&mut writer, tun, event, counts, stop)?;
+                #[cfg(target_os = "linux")]
+                {
+                    writer.push(payload);
+                    if writer.full() {
+                        flush_tun(&mut writer, tun, event, counts, stop)?;
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    // Copy directly from the decrypted UDP buffer into Wintun.
+                    // Never sleep on ring pressure while holding up UDP reads.
+                    use windows_delivery::Delivery;
+                    match windows_delivery::deliver(payload, stop, |p| tun.try_send(p))
+                        .context("write Wintun")?
+                    {
+                        Delivery::Sent => delivered += 1,
+                        Delivery::Congested => {
+                            dropped += 1;
+                            congested += 1;
+                        }
+                        Delivery::Dropped => dropped += 1,
+                        Delivery::Stopped => break,
+                    }
                 }
             }
         }
+        #[cfg(target_os = "windows")]
+        {
+            if delivered != 0 {
+                counts.received.fetch_add(delivered, Relaxed);
+            }
+            if dropped != 0 {
+                counts.dropped.fetch_add(dropped, Relaxed);
+            }
+            if congested != 0 {
+                counts.tun_backpressure_drops.fetch_add(congested, Relaxed);
+            }
+        }
+        #[cfg(target_os = "linux")]
         flush_tun(&mut writer, tun, event, counts, stop)?;
     }
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn flush_tun(
     writer: &mut tun_io::Writer,
     tun: &SyncDevice,
