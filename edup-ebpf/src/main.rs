@@ -10,7 +10,7 @@ mod packet;
 
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::{bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_xdp_adjust_head, bpf_xdp_adjust_tail},
+    helpers::{bpf_ktime_get_ns, bpf_xdp_adjust_head, bpf_xdp_adjust_tail},
     macros::{map, xdp},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, ProgramArray},
     programs::XdpContext,
@@ -26,6 +26,8 @@ use packet::*;
 static PROTOCOLS: ProgramArray = ProgramArray::with_max_entries(2, 0);
 #[map]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
+#[map]
+static USER_IDS: HashMap<i64, u16> = HashMap::with_max_entries(MAX_USERS, 0);
 #[map]
 static USERS: Array<User> = Array::with_max_entries(MAX_USERS, 0);
 #[map]
@@ -165,8 +167,9 @@ fn from_internet<const V6: bool>(ctx: &XdpContext, cfg: &Config, ip: &Ip) -> Res
     to_client::<V6>(ctx, cfg, ip, &transport, &mapping)
 }
 
-// Inlining lets the compiler reuse scratch slots instead of adding a live
-// nested frame to the inbound path on kernels with the 512-byte stack limit.
+// Return through BPF's single result register: low 32 bits are the checksum
+// sum (at most 1536 * 65535 / 2), high 32 bits hold a nonzero drop reason.
+// Rust's Result<u64, u32> must not cross a BPF function-call boundary.
 #[inline(always)]
 fn xor<const CHECKSUM: bool>(
     ctx: &XdpContext,
@@ -174,41 +177,57 @@ fn xor<const CHECKSUM: bool>(
     len: usize,
     seed: u64,
 ) -> Result<u64, u32> {
-    if len > wire::MAX_KS_WORDS as usize * 8 {
-        return Err(stat::DROP_TOO_BIG);
+    let result = xor_word::<CHECKSUM>(ctx, offset, len, seed);
+    if result >> 32 != 0 {
+        Err((result >> 32) as u32)
+    } else {
+        Ok(result)
     }
-    let mut sum = 0;
-    for word in 0..wire::MAX_KS_WORDS {
-        let base = word as usize * 8;
-        if base + 8 > len {
-            break;
+}
+
+#[inline(never)]
+fn xor_word<const CHECKSUM: bool>(ctx: &XdpContext, offset: usize, len: usize, seed: u64) -> u64 {
+    let result = (|| -> Result<u64, u32> {
+        if len > wire::MAX_KS_WORDS as usize * 8 {
+            return Err(stat::DROP_TOO_BIG);
         }
-        let key = wire::ks_word(seed, word);
-        let pos = offset + base;
-        let value = read::<u64>(ctx, pos)? ^ key.to_le();
-        write(ctx, pos, value)?;
-        if CHECKSUM {
-            sum += (value & 0xffff)
-                + ((value >> 16) & 0xffff)
-                + ((value >> 32) & 0xffff)
-                + (value >> 48);
+        let mut sum = 0;
+        for word in 0..wire::MAX_KS_WORDS {
+            let base = word as usize * 8;
+            if base + 8 > len {
+                break;
+            }
+            let key = wire::ks_word(seed, word);
+            let pos = offset + base;
+            let value = read::<u64>(ctx, pos)? ^ key.to_le();
+            write(ctx, pos, value)?;
+            if CHECKSUM {
+                sum += (value & 0xffff)
+                    + ((value >> 16) & 0xffff)
+                    + ((value >> 32) & 0xffff)
+                    + (value >> 48);
+            }
         }
+        let full = len / 8;
+        let key = wire::ks_word(seed, full as u32);
+        for byte in 0..7 {
+            if byte >= len % 8 {
+                break;
+            }
+            let pos = offset + full * 8 + byte;
+            let value = read::<u8>(ctx, pos)? ^ (key >> (byte * 8)) as u8;
+            write(ctx, pos, value)?;
+            if CHECKSUM {
+                // Native little-endian checksum words, including zero-padded odd tail.
+                sum += (value as u64) << ((byte & 1) * 8);
+            }
+        }
+        Ok(sum)
+    })();
+    match result {
+        Ok(sum) => sum,
+        Err(reason) => (reason as u64) << 32,
     }
-    let full = len / 8;
-    let key = wire::ks_word(seed, full as u32);
-    for byte in 0..7 {
-        if byte >= len % 8 {
-            break;
-        }
-        let pos = offset + full * 8 + byte;
-        let value = read::<u8>(ctx, pos)? ^ (key >> (byte * 8)) as u8;
-        write(ctx, pos, value)?;
-        if CHECKSUM {
-            // Native little-endian checksum words, including zero-padded odd tail.
-            sum += (value as u64) << ((byte & 1) * 8);
-        }
-    }
-    Ok(sum)
 }
 
 /// Complete the UDP checksum over the ciphertext, UDP header and IP pseudo
@@ -231,9 +250,10 @@ fn finish_outer_checksum(
         sum += read::<u16>(ctx, base + word * 2)? as u64;
         word = core::hint::black_box(word + 1);
     }
-    // UDP header (checksum zero) and plaintext nonce.
-    for word in 0..6 {
-        sum += read::<u16>(ctx, ETH + hlen + word * 2)? as u64;
+    // UDP header (checksum zero) and plaintext user ID.
+    for word in 0..4 {
+        let value = read::<u32>(ctx, ETH + hlen + word * 4)?;
+        sum += (value & 0xffff) as u64 + (value >> 16) as u64;
     }
     sum += (IPPROTO_UDP as u16).to_be() as u64 + ((len - hlen) as u16).to_be() as u64;
     let check = !csum::fold(sum);
@@ -288,9 +308,15 @@ fn endpoint(ctx: &XdpContext, user: u16, outer: &Ip, port: u16, now: u64) -> Res
 #[inline(always)]
 fn from_client<const V6: bool>(ctx: &XdpContext, cfg: &Config, outer: &Ip) -> Result<u32, u32> {
     let hlen = if V6 { 40 } else { 20 };
-    let overhead = hlen + 16;
+    let header = hlen + 8 + wire::HDR_LEN;
+    let overhead = header
+        - if V6 {
+            wire::IPV6_SAVING
+        } else {
+            wire::IPV4_SAVING
+        };
     // IPv4 options and IPv6 extension/fragment headers are unsupported.
-    if outer.header_len != hlen || outer.frag & 0x3fff != 0 || outer.len < overhead {
+    if outer.header_len != hlen || outer.frag & 0x3fff != 0 || outer.len < header {
         return Err(stat::DROP_BAD_HDR);
     }
     if outer.len > cfg.max_frame as usize {
@@ -300,23 +326,20 @@ fn from_client<const V6: bool>(ctx: &XdpContext, cfg: &Config, outer: &Ip) -> Re
     if udp_len != outer.len - hlen || (outer.v6 != 0 && read::<u16>(ctx, ETH + hlen + 6)? == 0) {
         return Err(stat::DROP_BAD_HDR);
     }
-    let nonce = u32::from_le(read(ctx, ETH + hlen + 8)?);
-    let seed = wire::ks_seed(
-        &Key {
-            k0: cfg.key0,
-            k1: cfg.key1,
-        },
-        nonce,
-    );
-    let hdr = u32::from_le(read::<u32>(ctx, ETH + hlen + 12)?) ^ wire::ks_word(seed, 0) as u32;
-    let (typ, flags, user) = wire::parse_hdr_word(hdr).ok_or(stat::DROP_BAD_HDR)?;
-    if flags != 0 || (typ != wire::TYPE_DATA && typ != wire::TYPE_KEEPALIVE) {
-        return Err(stat::DROP_BAD_HDR);
-    }
+    // Look up the public ID before reading or XORing the packet body.
+    let id = i64::from_be(read::<i64>(ctx, ETH + hlen + 8)?);
+    let user = unsafe { USER_IDS.get(&id) }
+        .copied()
+        .ok_or(stat::DROP_UNKNOWN_USER)?;
     let u = USERS.get(user as u32).ok_or(stat::DROP_UNKNOWN_USER)?;
-    if u.enabled == 0 {
+    if u.enabled == 0 || u.id != id {
         return Err(stat::DROP_UNKNOWN_USER);
     }
+    let seed = wire::ks_seed(&Key {
+        k0: u.key0,
+        k1: u.key1,
+    });
+    let typ = read::<u8>(ctx, ETH + hlen + 16)? ^ wire::ks_word(seed, 0) as u8;
     let port = read::<u16>(ctx, ETH + hlen)?;
     if port == 0 {
         return Err(stat::DROP_BAD_HDR);
@@ -324,24 +347,27 @@ fn from_client<const V6: bool>(ctx: &XdpContext, cfg: &Config, outer: &Ip) -> Re
     let now = unsafe { bpf_ktime_get_ns() };
     let mac = swapped_mac(ctx)?;
     if typ == wire::TYPE_KEEPALIVE {
-        if outer.len != overhead {
+        if outer.len != header {
             return Err(stat::DROP_BAD_HDR);
         }
         let ep = endpoint(ctx, user, outer, port, now)?;
         trim(ctx, ETH + outer.len)?;
         write_outer::<V6>(ctx, cfg, outer.len, &ep)?;
         write(ctx, 0, mac)?;
-        let ciphertext = read::<u32>(ctx, ETH + hlen + 12)?;
-        finish_outer_checksum(
-            ctx,
-            outer.len,
-            hlen,
-            (ciphertext & 0xffff) as u64 + (ciphertext >> 16) as u64,
-        )?;
+        let ciphertext = read::<u8>(ctx, ETH + hlen + 16)?;
+        finish_outer_checksum(ctx, outer.len, hlen, ciphertext as u64)?;
         count(stat::KEEPALIVE);
         return Ok(xdp_action::XDP_TX);
     }
-    xor::<false>(ctx, ETH + hlen + 12, outer.len - hlen - 12, seed)?;
+    if typ != if V6 { wire::TYPE_IPV6 } else { wire::TYPE_DATA } {
+        return Err(stat::DROP_BAD_HDR);
+    }
+    xor::<false>(ctx, ETH + hlen + 16, outer.len - hlen - 16, seed)?;
+    if V6 {
+        unpack_ipv6(ctx, ETH + header, outer.len - header)?;
+    } else {
+        unpack_ipv4(ctx, ETH + header, outer.len - header)?;
+    }
     let inner = if V6 {
         ipv6(ctx, ETH + overhead)
     } else {
@@ -351,31 +377,22 @@ fn from_client<const V6: bool>(ctx: &XdpContext, cfg: &Config, outer: &Ip) -> Re
     if inner.len + overhead != outer.len {
         return Err(stat::DROP_BAD_INNER);
     }
-    let inner_id = cfg.tun_net.wrapping_add(user as u32).to_be();
-    if V6 {
-        if cfg.nat_ip6 == [0; 16] {
-            return Err(stat::DROP_PROTO);
-        }
-        if read::<[u8; 16]>(ctx, inner.offset + 8)?
-            != edup_common::ipv6::address(cfg.tun_net6, user)
-        {
-            return Err(stat::DROP_SPOOF);
-        }
-    } else if inner.src != inner_id {
-        return Err(stat::DROP_SPOOF);
+    if V6 && cfg.nat_ip6 == [0; 16] {
+        return Err(stat::DROP_PROTO);
     }
     let l4 = transport(ctx, &inner, true)?;
     if inner.ttl <= 1 {
         return Err(stat::DROP_TTL);
     }
-    endpoint(ctx, user, outer, port, now)?;
     let key = NatOutKey {
-        inner_ip_be: inner_id,
         inner_port_be: l4.port,
         proto: inner.proto,
         v6: inner.v6,
+        user,
+        _pad: [0; 2],
     };
-    let public_port = nat::outbound(&key, user, l4.flags, cfg, now);
+    endpoint(ctx, user, outer, port, now)?;
+    let public_port = nat::outbound(&key, l4.flags, cfg, now);
     if public_port == 0 {
         return Err(stat::DROP_NAT_FULL);
     }
@@ -417,6 +434,100 @@ fn from_client<const V6: bool>(ctx: &XdpContext, cfg: &Config, outer: &Ip) -> Re
     Ok(xdp_action::XDP_TX)
 }
 
+/// Reuse discarded tunnel-header space: L4 and options stay at their offsets.
+#[inline(never)]
+fn unpack_ipv4(ctx: &XdpContext, compact: usize, len: usize) -> Result<(), u32> {
+    if len < wire::IPV4_META_LEN || len > 65525 {
+        return Err(stat::DROP_BAD_INNER);
+    }
+    let peer = read::<u32>(ctx, compact)?;
+    let id = read::<u16>(ctx, compact + 4)?;
+    let flags = read::<u8>(ctx, compact + 6)?;
+    let tos = read::<u8>(ctx, compact + 7)?;
+    let ttl_proto = read::<u16>(ctx, compact + 8)?;
+    let options = (flags & 15) as usize * 4;
+    if flags & 0xb0 != 0 || options > 40 || len < wire::IPV4_META_LEN + options {
+        return Err(stat::DROP_BAD_INNER);
+    }
+    let offset = compact - wire::IPV4_SAVING;
+    write(
+        ctx,
+        offset,
+        u16::from_ne_bytes([0x45 + options as u8 / 4, tos]),
+    )?;
+    write(ctx, offset + 2, ((len + wire::IPV4_SAVING) as u16).to_be())?;
+    write(ctx, offset + 4, id)?;
+    write(ctx, offset + 6, u16::from_ne_bytes([flags & 0x40, 0]))?;
+    write(ctx, offset + 8, ttl_proto)?;
+    write(ctx, offset + 10, 0u16)?;
+    write(ctx, offset + 12, 0u32)?;
+    write(ctx, offset + 16, peer)?;
+    let mut sum = 0u64;
+    let mut i = 0;
+    while i < 30 {
+        if i * 2 >= 20 + options {
+            break;
+        }
+        sum += read::<u16>(ctx, offset + i * 2)? as u64;
+        i = core::hint::black_box(i + 1);
+    }
+    write(ctx, offset + 10, !csum::fold(sum))
+}
+
+/// DNAT has normalized the destination/checksum to zero. Keep only peer metadata.
+#[inline(never)]
+fn pack_ipv4(ctx: &XdpContext, ip: &Ip) -> Result<(), u32> {
+    if ip.header_len > 60 || ip.frag & 0xbfff != 0 {
+        return Err(stat::DROP_BAD_INNER);
+    }
+    let peer = read::<u32>(ctx, ip.offset + 12)?;
+    let id = read::<u16>(ctx, ip.offset + 4)?;
+    let tos = read::<u8>(ctx, ip.offset + 1)?;
+    let ttl_proto = read::<u16>(ctx, ip.offset + 8)?;
+    let flags = ((ip.frag >> 8) as u8 & 0x40) | (ip.header_len as u8 / 4 - 5);
+    let offset = ip.offset + wire::IPV4_SAVING;
+    write(ctx, offset, peer)?;
+    write(ctx, offset + 4, id)?;
+    write(ctx, offset + 6, flags)?;
+    write(ctx, offset + 7, tos)?;
+    write(ctx, offset + 8, ttl_proto)
+}
+
+/// Expand into discarded outer-header space without moving the transport bytes.
+#[inline(never)]
+fn unpack_ipv6(ctx: &XdpContext, compact: usize, len: usize) -> Result<(), u32> {
+    if len < wire::IPV6_META_LEN || len - wire::IPV6_META_LEN > 65535 {
+        return Err(stat::DROP_BAD_INNER);
+    }
+    let peer = read::<[u8; 16]>(ctx, compact)?;
+    let fields = read::<u32>(ctx, compact + 16)?;
+    if fields.to_be() & 0xf0000000 != 0 {
+        return Err(stat::DROP_BAD_INNER);
+    }
+    let next_hop = read::<u16>(ctx, compact + 20)?;
+    let offset = compact - wire::IPV6_SAVING;
+    write(ctx, offset, fields | 0x60000000u32.to_be())?;
+    write(
+        ctx,
+        offset + 4,
+        ((len - wire::IPV6_META_LEN) as u16).to_be(),
+    )?;
+    write(ctx, offset + 6, next_hop)?;
+    write(ctx, offset + 8, [0u8; 16])?;
+    write(ctx, offset + 24, peer)
+}
+
+#[inline(never)]
+fn pack_ipv6(ctx: &XdpContext, ip: &Ip) -> Result<(), u32> {
+    let peer = read::<[u8; 16]>(ctx, ip.offset + 8)?;
+    let fields = read::<u32>(ctx, ip.offset)? & 0x0fffffffu32.to_be();
+    let next_hop = read::<u16>(ctx, ip.offset + 6)?;
+    let offset = ip.offset + wire::IPV6_SAVING;
+    write(ctx, offset, peer)?;
+    write(ctx, offset + 16, fields)?;
+    write(ctx, offset + 20, next_hop)
+}
+
 #[inline(always)]
 fn to_client<const V6: bool>(
     ctx: &XdpContext,
@@ -439,28 +550,25 @@ fn to_client<const V6: bool>(
         return Err(stat::DROP_NO_ENDPOINT);
     }
     let hlen = if V6 { 40 } else { 20 };
-    let overhead = hlen + 16;
+    let overhead = hlen + 8 + wire::HDR_LEN
+        - if V6 {
+            wire::IPV6_SAVING
+        } else {
+            wire::IPV4_SAVING
+        };
     let len = ip.len + overhead;
-    if len > cfg.max_frame as usize || ip.len + 4 > wire::MAX_KS_WORDS as usize * 8 {
+    if len > cfg.max_frame as usize || len - hlen - 16 > wire::MAX_KS_WORDS as usize * 8 {
         return Err(stat::DROP_TOO_BIG);
     }
     if V6 {
-        translate6(
-            ctx,
-            ip,
-            l4,
-            &edup_common::ipv6::address(cfg.tun_net6, mapping.user),
-            mapping.inner_port_be as u32,
-        )?;
+        translate6(ctx, ip, l4, &[0; 16], mapping.inner_port_be as u32)?;
     } else {
-        translate(
-            ctx,
-            ip,
-            l4,
-            mapping.inner_ip_be,
-            mapping.inner_port_be,
-            false,
-        )?;
+        translate(ctx, ip, l4, 0, mapping.inner_port_be, false)?;
+    }
+    if V6 {
+        pack_ipv6(ctx, ip)?;
+    } else {
+        pack_ipv4(ctx, ip)?;
     }
     trim(ctx, ETH + ip.len)?;
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, -(overhead as i32)) } != 0 {
@@ -468,24 +576,20 @@ fn to_client<const V6: bool>(
     }
     write(ctx, 0, ep.mac)?;
     write_outer::<V6>(ctx, cfg, len, &ep)?;
-    let nonce = unsafe { bpf_get_prandom_u32() };
-    write(ctx, ETH + hlen + 8, nonce.to_le())?;
+    write(ctx, ETH + hlen + 8, u.id.to_be())?;
     write(
         ctx,
-        ETH + hlen + 12,
-        wire::hdr_word(wire::TYPE_DATA, mapping.user).to_le(),
+        ETH + hlen + 16,
+        if V6 { wire::TYPE_IPV6 } else { wire::TYPE_DATA },
     )?;
     let sum = xor::<true>(
         ctx,
-        ETH + hlen + 12,
-        ip.len + 4,
-        wire::ks_seed(
-            &Key {
-                k0: cfg.key0,
-                k1: cfg.key1,
-            },
-            nonce,
-        ),
+        ETH + hlen + 16,
+        len - hlen - 16,
+        wire::ks_seed(&Key {
+            k0: u.key0,
+            k1: u.key1,
+        }),
     )?;
     finish_outer_checksum(ctx, len, hlen, sum)?;
     count(stat::TX_TUNNEL);

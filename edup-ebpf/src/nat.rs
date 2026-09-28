@@ -43,8 +43,8 @@ fn alive(v: &NatInVal, proto: u8, now: u64) -> bool {
 }
 
 #[inline(always)]
-fn owner(v: &NatInVal, key: &NatOutKey, user: u16) -> bool {
-    v.inner_ip_be == key.inner_ip_be && v.inner_port_be == key.inner_port_be && v.user == user
+fn owner(v: &NatInVal, key: &NatOutKey) -> bool {
+    v.inner_port_be == key.inner_port_be && v.user == key.user
 }
 
 #[inline(always)]
@@ -93,7 +93,7 @@ fn expire(key: &NatInKey, v: &NatInVal, now: u64) {
 }
 
 #[inline(never)]
-pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -> u16 {
+pub fn outbound(key: &NatOutKey, flags: u8, cfg: &Config, now: u64) -> u16 {
     if let Some(ptr) = NAT_OUT.get_ptr(key) {
         let port = unsafe { core::ptr::read_volatile(ptr).pub_port_be };
         let reverse = NatInKey {
@@ -102,7 +102,7 @@ pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -
             v6: key.v6,
         };
         if let Some(v) = snapshot(&reverse) {
-            if owner(&v, key, user) && alive(&v, key.proto, now) {
+            if owner(&v, key) && alive(&v, key.proto, now) {
                 touch(&reverse, &v, flags, now);
                 return port;
             }
@@ -115,9 +115,13 @@ pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -
         return 0;
     }
     let range = cfg.nat_port_max as u32 - cfg.nat_port_min as u32 + 1;
-    let hash =
-        mix64(key.inner_ip_be as u64 | (key.inner_port_be as u64) << 32 | (key.proto as u64) << 48)
-            as u32;
+    let hash = mix64(
+        mix64(0)
+            ^ (key.user as u64) << 32
+            ^ (key.inner_port_be as u64) << 16
+            ^ (key.proto as u64) << 8
+            ^ key.v6 as u64,
+    ) as u32;
     let start = hash % range;
     for probe in 0..PROBES {
         if probe >= range {
@@ -138,11 +142,10 @@ pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -
         }
         let value = NatInVal {
             last_seen_ns: now,
-            inner_ip_be: key.inner_ip_be,
             inner_port_be: key.inner_port_be,
-            user,
+            user: key.user,
             state: state(key.proto, ST_OTHER, flags),
-            _pad: [0; 7],
+            _pad: [0; 3],
         };
         if NAT_IN.insert(reverse, value, BPF_NOEXIST as u64).is_err() {
             continue;
@@ -165,7 +168,7 @@ pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -
                 v6: key.v6,
             };
             if let Some(v) = snapshot(&reverse)
-                && owner(&v, key, user)
+                && owner(&v, key)
                 && alive(&v, key.proto, now)
             {
                 return port;
@@ -176,7 +179,8 @@ pub fn outbound(key: &NatOutKey, user: u16, flags: u8, cfg: &Config, now: u64) -
     0
 }
 
-#[inline(never)]
+// Reuse caller scratch slots to stay within older kernels' combined stack limit.
+#[inline(always)]
 pub fn inbound(key: &NatInKey, flags: u8, now: u64) -> Option<NatInVal> {
     let v = snapshot(key)?;
     if !alive(&v, key.proto, now) {
@@ -184,10 +188,11 @@ pub fn inbound(key: &NatInKey, flags: u8, now: u64) -> Option<NatInVal> {
         return None;
     }
     let forward = NatOutKey {
-        inner_ip_be: v.inner_ip_be,
         inner_port_be: v.inner_port_be,
         proto: key.proto,
         v6: key.v6,
+        user: v.user,
+        _pad: [0; 2],
     };
     let ptr = NAT_OUT.get_ptr(forward)?;
     if unsafe { core::ptr::read_volatile(ptr).pub_port_be } != key.pub_port_be {

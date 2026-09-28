@@ -25,9 +25,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const MAPS: [&str; 7] = [
+const MAPS: [&str; 8] = [
     "CONFIG",
     "USERS",
+    "USER_IDS",
     "ENDPOINTS",
     "NAT_OUT",
     "NAT_IN",
@@ -238,16 +239,22 @@ fn load(cfg: &Settings) -> Result<Ebpf> {
         cfg.map_config()?,
         0,
     )?;
-    let mut users = Array::<_, User>::try_from(bpf.map_mut("USERS").context("missing USERS")?)?;
-    for &id in &cfg.users {
-        users.set(
-            id as u32,
+    for (index, user) in cfg.users.iter().enumerate() {
+        let slot = (index + 1) as u16;
+        let key = edup_common::key::derive_key(&user.password);
+        Array::<_, User>::try_from(bpf.map_mut("USERS").context("missing USERS")?)?.set(
+            slot as u32,
             User {
+                id: user.id,
+                key0: key.k0,
+                key1: key.k1,
                 enabled: 1,
                 ..Default::default()
             },
             0,
         )?;
+        HashMap::<_, i64, u16>::try_from(bpf.map_mut("USER_IDS").context("missing USER_IDS")?)?
+            .insert(user.id, slot, 0)?;
     }
     // Populate and pin the program array with this generation's protocol
     // programs before attaching the dispatcher. Reload swaps the whole graph.
@@ -427,30 +434,23 @@ fn stats(root: &Path) -> Result<()> {
 
 fn users(root: &Path) -> Result<()> {
     let (active, _link) = live(root)?;
-    let config = pinned_array::<Config>(&active.path.join("CONFIG"))?.get(&0, 0)?;
     let users = pinned_array::<User>(&active.path.join("USERS"))?;
     ensure!(users.len() == MAX_USERS, "incompatible USERS ABI");
     let endpoints = HashMap::<_, u16, Endpoint>::try_from(Map::HashMap(MapData::from_pin(
         active.path.join("ENDPOINTS"),
     )?))?;
     let now = sys::monotonic_ns()?;
-    println!("ID\tTUNNEL_IP\tENDPOINT\tLAST_SEEN_SECONDS_AGO");
+    println!("ID\tINDEX\tENDPOINT\tLAST_SEEN_SECONDS_AGO");
     for id in 0..MAX_USERS {
         let user = users.get(&id, 0)?;
         if user.enabled == 0 {
             continue;
         }
-        let ip = Ipv4Addr::from(config.tun_net + id);
         let endpoint = endpoints.get(&(id as u16), 0).ok();
         if endpoint.is_none() {
-            println!("{id}\t{ip}\t-\t-");
+            println!("{}\t{id}\t-\t-", user.id);
         } else {
             let ep = endpoint.unwrap();
-            let ip = if ep.v6 != 0 {
-                Ipv6Addr::from(edup_common::ipv6::address(config.tun_net6, id as u16)).to_string()
-            } else {
-                ip.to_string()
-            };
             let endpoint = if ep.v6 != 0 {
                 format!("[{}]", Ipv6Addr::from(ep.address))
             } else {
@@ -459,7 +459,8 @@ fn users(root: &Path) -> Result<()> {
             };
             let port = u16::from_be(ep.port_be);
             println!(
-                "{id}\t{ip}\t{endpoint}:{port}\t{}",
+                "{}\t{id}\t{endpoint}:{port}\t{}",
+                user.id,
                 now.saturating_sub(user.last_seen_ns) / 1_000_000_000
             );
         }

@@ -15,16 +15,10 @@ pub const IPPROTO_ICMPV6: u8 = 58;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Config {
-    pub key0: u64,
-    pub key1: u64,
     /// Адрес, на который приходят туннельные пакеты.
     pub server_ip_be: u32,
     /// Внешний адрес NAT (обычно совпадает с `server_ip_be`).
     pub nat_ip_be: u32,
-    /// Сеть туннеля, host order, например 10.66.0.0.
-    pub tun_net: u32,
-    /// Маска сети туннеля, host order. Префикс не длиннее /16.
-    pub tun_mask: u32,
     pub port_be: u16,
     pub nat_port_min: u16,
     pub nat_port_max: u16,
@@ -33,7 +27,6 @@ pub struct Config {
     /// All-zero addresses disable the corresponding IPv6 feature.
     pub server_ip6: [u8; 16],
     pub nat_ip6: [u8; 16],
-    pub tun_net6: [u8; 16],
     /// Optional next-hop MAC overrides; zero uses the learned upstream MAC.
     pub gateway_mac: [u8; 6],
     pub gateway6_mac: [u8; 6],
@@ -51,11 +44,14 @@ pub struct Endpoint {
     pub _pad: u8,
 }
 
-/// Значение карты `USERS`, индекс — ID пользователя.
-/// Туннельный адрес пользователя всегда `tun_net + id`.
+/// USERS is indexed by the internal 16-bit user index (config position + 1).
+/// USER_IDS maps the public signed 64-bit ID to this array index.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct User {
+    pub id: i64,
+    pub key0: u64,
+    pub key1: u64,
     /// Последний адрес клиента: `ip_be | port_be << 32`; 0 — ещё неизвестен.
     pub endpoint: u64,
     pub last_seen_ns: u64,
@@ -81,16 +77,17 @@ impl User {
 }
 
 /// Ключ исходящей трансляции (endpoint-independent mapping, RFC 4787):
-/// один внутренний (ip, port) — один внешний порт для любых адресатов.
+/// Both families use (user, port, protocol, family); local addresses are omitted.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NatOutKey {
-    pub inner_ip_be: u32,
     /// Порт TCP/UDP или идентификатор ICMP echo.
     pub inner_port_be: u16,
     pub proto: u8,
-    /// 0 for IPv4, 1 for IPv6. IPv6 uses the user's deterministic IPv4 ID here.
+    /// 0 for IPv4, 1 for IPv6.
     pub v6: u8,
+    pub user: u16,
+    pub _pad: [u8; 2],
 }
 
 #[repr(C)]
@@ -113,11 +110,10 @@ pub struct NatInKey {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NatInVal {
     pub last_seen_ns: u64,
-    pub inner_ip_be: u32,
     pub inner_port_be: u16,
     pub user: u16,
     pub state: u8,
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 3],
 }
 
 pub const ST_OTHER: u8 = 0;
@@ -195,10 +191,10 @@ mod pod {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<Config>() == 104);
+    assert!(core::mem::size_of::<Config>() == 64);
     assert!(core::mem::size_of::<Endpoint>() == 32);
-    assert!(core::mem::size_of::<User>() == 24);
+    assert!(core::mem::size_of::<User>() == 48);
     assert!(core::mem::size_of::<NatOutKey>() == 8);
     assert!(core::mem::size_of::<NatInKey>() == 4);
-    assert!(core::mem::size_of::<NatInVal>() == 24);
+    assert!(core::mem::size_of::<NatInVal>() == 16);
 };

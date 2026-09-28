@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
-use edup_common::wire;
 #[cfg(target_os = "linux")]
-use edup_common::{key::derive_key, maps::Config};
+use edup_common::maps::Config;
+use edup_common::wire;
 use serde::Deserialize;
 use std::{
     collections::BTreeSet,
@@ -42,20 +42,25 @@ pub struct Settings {
     pub nat_ip: Ipv4Addr,
     pub server_ip6: Option<Ipv6Addr>,
     pub nat_ip6: Option<Ipv6Addr>,
-    pub tunnel_net6: Option<String>,
     pub gateway_mac: Option<String>,
     pub gateway6_mac: Option<String>,
     pub port: u16,
-    pub password: String,
-    pub tunnel_net: String,
     pub nat_port_min: u16,
     pub nat_port_max: u16,
     #[serde(default = "default_frame")]
     pub max_frame: u16,
     #[serde(default)]
     pub xdp_mode: Mode,
-    pub users: Vec<u16>,
+    pub users: Vec<UserSettings>,
 }
+// No Debug: credentials must not appear in diagnostics.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserSettings {
+    pub id: i64,
+    pub password: String,
+}
+
 fn default_frame() -> u16 {
     1500
 }
@@ -92,28 +97,11 @@ impl Settings {
         }
         ensure!(
             self.server_ip6.is_some() == self.nat_ip6.is_some(),
-            "server_ip6, nat_ip6 and tunnel_net6 must be configured together"
+            "server_ip6 and nat_ip6 must be configured together"
         );
-        ensure!(
-            self.nat_ip6.is_some() == self.tunnel_net6.is_some(),
-            "nat_ip6 and tunnel_net6 must be configured together"
-        );
-        if let Some(net) = &self.tunnel_net6 {
-            let net = edup_common::ipv6::network(net)
-                .context("tunnel_net6 must be a global/ULA /112 network with zero host bits")?;
-            for ip in [self.server_ip6, self.nat_ip6].into_iter().flatten() {
-                ensure!(
-                    ip.octets()[..14] != net[..14],
-                    "outer IPv6 addresses must be outside tunnel_net6"
-                );
-            }
-            let overhead = if self.server_ip6.is_some() {
-                wire::OVERHEAD_V6
-            } else {
-                wire::OVERHEAD_V4
-            };
+        if self.server_ip6.is_some() {
             ensure!(
-                self.max_frame as usize >= 1280 + overhead,
+                self.max_frame as usize >= 1280 + wire::OVERHEAD_V6,
                 "max_frame is too small for IPv6 tunnel MTU 1280"
             );
         }
@@ -136,7 +124,6 @@ impl Settings {
             ensure!(unicast(ip), "{name} must be a unicast IPv4 address");
         }
         ensure!(self.port != 0, "port must be nonzero");
-        ensure!(!self.password.is_empty(), "password must not be empty");
         ensure!(
             self.nat_port_min > 0 && self.nat_port_min <= self.nat_port_max,
             "invalid NAT port range"
@@ -145,52 +132,28 @@ impl Settings {
             !(self.nat_port_min..=self.nat_port_max).contains(&self.port),
             "NAT range overlaps the tunnel port"
         );
-        let max = wire::MAX_KS_WORDS as usize * 8 + if self.server_ip6.is_some() { 52 } else { 32 };
+        let max = wire::MAX_KS_WORDS as usize * 8
+            + if self.server_ip6.is_some() {
+                wire::OVERHEAD_V6 + wire::IPV6_SAVING
+            } else {
+                wire::OVERHEAD_V4 + wire::IPV4_SAVING
+            }
+            - wire::CONTROL_LEN;
         ensure!(
             (576 + wire::OVERHEAD_V4..=max).contains(&(self.max_frame as usize)),
             "max_frame must be between {} and {max}",
             576 + wire::OVERHEAD_V4
         );
-        let (net, mask) = self.network()?;
         ensure!(
-            u32::from(self.server_ip) & mask != net && u32::from(self.nat_ip) & mask != net,
-            "outer addresses must be outside tunnel_net"
+            self.users.len() < edup_common::maps::MAX_USERS as usize,
+            "at most 65535 users are supported"
         );
         let mut ids = BTreeSet::new();
-        for &id in &self.users {
-            ensure!(ids.insert(id), "duplicate user ID {id}");
-            ensure!(
-                id != 0 && id as u32 != !mask,
-                "user ID {id} is a network or broadcast address"
-            );
+        for user in &self.users {
+            ensure!(ids.insert(user.id), "duplicate user ID {}", user.id);
+            ensure!(!user.password.is_empty(), "user password must not be empty");
         }
         Ok(())
-    }
-
-    pub fn network(&self) -> Result<(u32, u32)> {
-        let (ip, prefix) = self
-            .tunnel_net
-            .split_once('/')
-            .context("tunnel_net must be IPv4/prefix")?;
-        let ip: Ipv4Addr = ip.parse().context("invalid tunnel_net address")?;
-        let prefix: u32 = prefix.parse().context("invalid tunnel_net prefix")?;
-        ensure!(
-            (1..=16).contains(&prefix),
-            "tunnel_net prefix must be between /1 and /16"
-        );
-        let mask = u32::MAX << (32 - prefix);
-        let net = u32::from(ip);
-        ensure!(
-            net & mask == net,
-            "tunnel_net must be a network address with zero host bits"
-        );
-        ensure!(unicast(ip), "tunnel_net must be unicast");
-        // Large prefixes must not span reserved/multicast ranges either.
-        ensure!(
-            unicast(Ipv4Addr::from(net | !mask)),
-            "tunnel_net spans non-unicast addresses"
-        );
-        Ok((net, mask))
     }
 
     #[cfg(target_os = "linux")]
@@ -214,26 +177,15 @@ impl Settings {
 
     #[cfg(target_os = "linux")]
     pub fn map_config(&self) -> Result<Config> {
-        let key = derive_key(&self.password);
-        let (tun_net, tun_mask) = self.network()?;
         Ok(Config {
-            key0: key.k0,
-            key1: key.k1,
             server_ip_be: u32::from_ne_bytes(self.server_ip.octets()),
             nat_ip_be: u32::from_ne_bytes(self.nat_ip.octets()),
-            tun_net,
-            tun_mask,
             port_be: self.port.to_be(),
             nat_port_min: self.nat_port_min,
             nat_port_max: self.nat_port_max,
             max_frame: self.max_frame,
             server_ip6: self.server_ip6.unwrap_or(Ipv6Addr::UNSPECIFIED).octets(),
             nat_ip6: self.nat_ip6.unwrap_or(Ipv6Addr::UNSPECIFIED).octets(),
-            tun_net6: self
-                .tunnel_net6
-                .as_deref()
-                .and_then(edup_common::ipv6::network)
-                .unwrap_or([0; 16]),
             gateway_mac: parse_mac(self.gateway_mac.as_deref())?,
             gateway6_mac: parse_mac(self.gateway6_mac.as_deref())?,
             _pad: [0; 4],
@@ -277,7 +229,6 @@ mod tests {
     fn example_and_byte_order() {
         let cfg = config();
         cfg.validate().unwrap();
-        assert_eq!(cfg.network().unwrap(), (0x0a420000, 0xffff0000));
         #[cfg(target_os = "linux")]
         {
             let raw = cfg.map_config().unwrap();
@@ -286,33 +237,36 @@ mod tests {
         }
     }
     #[test]
-    fn rejects_invalid_user_ids_and_duplicates() {
-        for ids in [vec![0], vec![65535], vec![7, 7]] {
-            let mut cfg = config();
-            cfg.users = ids;
-            assert!(cfg.validate().is_err());
-        }
+    fn user_ids_and_capacity() {
         let mut cfg = config();
-        cfg.tunnel_net = "10.64.0.0/15".into();
-        cfg.users = vec![65535];
+        cfg.users[0].id = i64::MIN;
+        cfg.users[1].id = i64::MAX;
         cfg.validate().unwrap();
+        cfg.users[1].id = cfg.users[0].id;
+        assert!(cfg.validate().is_err());
+        cfg.users[1].id = 0;
+        cfg.users[1].password.clear();
+        assert!(cfg.validate().is_err());
+        cfg.users = (0..65535)
+            .map(|id| UserSettings {
+                id,
+                password: "test".into(),
+            })
+            .collect();
+        cfg.validate().unwrap();
+        cfg.users.push(UserSettings {
+            id: 65535,
+            password: "test".into(),
+        });
+        assert!(cfg.validate().is_err());
     }
     #[test]
-    fn rejects_bad_networks_and_addresses() {
-        for net in [
-            "10.66.0.1/16",
-            "10.66.0.0/24",
-            "0.0.0.0/0",
-            "224.0.0.0/8",
-            "10.0.0.0/33",
-        ] {
+    fn rejects_bad_addresses() {
+        for ip in ["0.0.0.0", "127.0.0.1", "224.0.0.1", "255.255.255.255"] {
             let mut cfg = config();
-            cfg.tunnel_net = net.into();
-            assert!(cfg.validate().is_err(), "{net}");
+            cfg.server_ip = ip.parse().unwrap();
+            assert!(cfg.validate().is_err());
         }
-        let mut cfg = config();
-        cfg.server_ip = "10.66.0.1".parse().unwrap();
-        assert!(cfg.validate().is_err());
     }
     #[test]
     fn rejects_ports_mtu_and_unsafe_interface() {
@@ -322,7 +276,7 @@ mod tests {
         let mut cfg = config();
         cfg.nat_port_min = cfg.nat_port_max + 1;
         assert!(cfg.validate().is_err());
-        for mtu in [0, 611, 1569] {
+        for mtu in [0, 602, 1573] {
             let mut cfg = config();
             cfg.max_frame = mtu;
             assert!(cfg.validate().is_err());
@@ -340,8 +294,6 @@ mod tests {
         c.server_ip6 = Some("2001:db8::1".parse().unwrap());
         assert!(c.validate().is_err());
         c.nat_ip6 = c.server_ip6;
-        assert!(c.validate().is_err());
-        c.tunnel_net6 = Some("fd66::/112".into());
         c.gateway6_mac = Some("02:01:02:03:04:05".into());
         c.validate().unwrap();
         #[cfg(target_os = "linux")]
@@ -350,9 +302,9 @@ mod tests {
             assert_eq!(raw.nat_ip6, c.nat_ip6.unwrap().octets());
             assert_eq!(raw.gateway6_mac, [2, 1, 2, 3, 4, 5]);
         }
-        c.max_frame = 1335;
+        c.max_frame = 1318;
         assert!(c.validate().is_err());
-        c.max_frame = 1336;
+        c.max_frame = 1319;
         c.validate().unwrap();
         for mac in [
             "",
@@ -366,7 +318,7 @@ mod tests {
         }
         c.gateway6_mac = None;
         c.nat_ip6 = Some("fd66::8".parse().unwrap());
-        assert!(c.validate().is_err());
+        c.validate().unwrap();
     }
     #[cfg(target_os = "linux")]
     #[test]

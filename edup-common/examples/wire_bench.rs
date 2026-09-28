@@ -5,14 +5,14 @@ use std::{hint::black_box, time::Instant};
 fn main() {
     let key = black_box(Key { k0: 123, k1: 456 });
     // Includes short control/ACK packets and a typical full-size tunnel packet.
-    for len in [4, 44, 1404] {
+    for len in [1, 31, 1391] {
         let mut buf = vec![0x5a; len];
         let iterations = 1_000_000;
         let mut samples = Vec::new();
         for _ in 0..7 {
             let start = Instant::now();
-            for nonce in 0..iterations {
-                xor_region(black_box(&key), black_box(nonce), black_box(&mut buf));
+            for _ in 0..iterations {
+                xor_region(black_box(&key), black_box(&mut buf));
             }
             black_box(&buf);
             samples.push(start.elapsed().as_nanos() as f64 / iterations as f64);

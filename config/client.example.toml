@@ -1,9 +1,10 @@
 server = "192.0.2.1:7777"
-user = 7
+user = 4829017365182049271
 password = "replace-this-password"
-tunnel_net = "10.66.0.0/16"
+# Local TUN address only; clients may all use the same address.
+tunnel_ip = "10.66.0.7" # Optional; default is 10.66.0.1
 interface = "edup0"
-mtu = 1464
+mtu = 1473
 keepalive_secs = 15
 routes = true
 # Opportunistic Linux GSO/GRO, Windows USO/URO; false uses ordinary packets.
@@ -11,7 +12,7 @@ offload = true
 # Windows: by default wintun.dll is loaded beside edup-client.exe.
 # wintun_dll = 'C:\Program Files\edup\wintun.dll'
 
-# IPv6 mode: change server to "[2001:db8::1]:7777", mtu to 1444,
-# and replace tunnel_net with the following (must match the server):
-# tunnel_net6 = "fd66::/112"
+# IPv6 mode: change server to "[2001:db8::1]:7777", mtu to 1461,
+# optional local IPv6 address (default is fd66::1):
+# tunnel_ip6 = "fd66::7"
 # IPv6 requires mtu >= 1280; each mode carries only its own IP family.

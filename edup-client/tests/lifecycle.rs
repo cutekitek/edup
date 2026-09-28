@@ -134,8 +134,8 @@ fn isolated(ipv6: bool) {
         let config = fs::read_to_string(&path)
             .unwrap()
             .replace("\"192.0.2.1:7777\"", "\"[2001:db8:1::1]:7777\"")
-            .replace("mtu = 1464", "mtu = 1444");
-        fs::write(path, format!("{config}\ntunnel_net6 = \"fd66::/112\"\n")).unwrap();
+            .replace("mtu = 1473", "mtu = 1461");
+        fs::write(path, format!("{config}\ntunnel_ip6 = \"fd66::7\"\n")).unwrap();
     }
     ip(&["link", "set", "lo", "up"]);
     ip(&[
@@ -198,7 +198,7 @@ fn isolated(ipv6: bool) {
     })
     .unwrap();
     udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let payload = vec![0x5au8; if ipv6 { 1396 } else { 1400 }];
+    let payload = vec![0x5au8; if ipv6 { 1392 } else { 1400 }];
     udp.send(&payload).unwrap();
     let mut reply = [0u8; 1500];
     let len = udp.recv(&mut reply).unwrap();
@@ -289,7 +289,7 @@ fn isolated(ipv6: bool) {
         let udp6 = UdpSocket::bind("[fd66::7]:0").unwrap();
         udp6.connect("[2001:db8:2::9]:9000").unwrap();
         udp6.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let payload = [0x59; 1396]; // 1444-byte IPv6 packet, 1500-byte outer packet
+        let payload = [0x59; 1413]; // 1461-byte IPv6 packet, 1500-byte outer packet
         udp6.send(&payload).unwrap();
         let mut data = [0; 1500];
         let n = udp6.recv(&mut data).unwrap();
@@ -422,7 +422,6 @@ fn echo_peer() {
     let mut keepalives = 0;
     let mut injected = false;
     let mut burst_reply = Vec::new();
-    let mut nonce = 10;
     while !dir.join("stop").exists() {
         let (len, from) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
@@ -437,22 +436,34 @@ fn echo_peer() {
             Err(e) => panic!("{e}"),
         };
         let opened = wire::open(&key, &mut buf[..len]).unwrap();
-        assert_eq!(opened.user, 7);
-        let burst = opened.typ == wire::TYPE_DATA
-            && len == wire::HDR_LEN + if ipv6 { 40 } else { 20 } + 8 + 1000
-            && buf[wire::HDR_LEN + if ipv6 { 48 } else { 28 }] == 0x6b;
+        assert_eq!(opened.user, 4829017365182049271);
+        let mut packet = [0u8; 2048];
+        let ip_len = if opened.typ == wire::TYPE_KEEPALIVE {
+            0
+        } else {
+            wire::unpack(
+                opened.typ,
+                &buf[wire::HDR_LEN..len],
+                &mut packet,
+                if ipv6 { &[0; 16][..] } else { &[0; 4][..] },
+                true,
+            )
+            .unwrap()
+        };
+        let burst = ip_len == if ipv6 { 40 } else { 20 } + 8 + 1000
+            && packet[if ipv6 { 48 } else { 28 }] == 0x6b;
         if opened.typ == wire::TYPE_KEEPALIVE {
             keepalives += 1;
             fs::write(dir.join("keepalives"), keepalives.to_string()).unwrap();
             if !injected {
                 socket.send_to(&[0; 3], from).unwrap();
                 let mut wrong = [0; wire::HDR_LEN];
-                wire::seal(&key, 9, wire::TYPE_KEEPALIVE, 42, &mut wrong);
+                wire::seal(&key, wire::TYPE_KEEPALIVE, 42, &mut wrong);
                 socket.send_to(&wrong, from).unwrap();
                 injected = true;
             }
         } else {
-            let ip = &mut buf[wire::HDR_LEN..len];
+            let ip = &mut packet[..ip_len];
             if ip[0] >> 4 == 6 {
                 assert_eq!(l4_checksum6(ip), 0, "IPv6 TUN checksum");
                 for i in 0..16 {
@@ -517,8 +528,19 @@ fn echo_peer() {
                 ip[10..12].copy_from_slice(&sum.to_be_bytes());
             }
         }
-        nonce += 1;
-        wire::seal(&key, nonce, opened.typ, 7, &mut buf[..len]);
+        let len = if opened.typ == wire::TYPE_KEEPALIVE {
+            wire::seal(&key, opened.typ, 4829017365182049271, &mut buf[..len]);
+            len
+        } else {
+            buf[wire::HDR_LEN..wire::HDR_LEN + ip_len].copy_from_slice(&packet[..ip_len]);
+            wire::seal_data(
+                &key,
+                4829017365182049271,
+                &mut buf[..wire::HDR_LEN + ip_len],
+                false,
+            )
+            .unwrap()
+        };
         if burst {
             burst_reply.extend_from_slice(&buf[..len]);
             if burst_reply.len() == 32 * len {

@@ -14,9 +14,9 @@ fn pair(offload: bool) -> (Transport, Transport) {
         Transport::new(b, offload).unwrap(),
     )
 }
-fn sealed(nonce: u32, len: usize) -> Vec<u8> {
-    let mut p = vec![nonce as u8; len];
-    wire::seal(&derive_key("test"), nonce, wire::TYPE_DATA, 7, &mut p);
+fn sealed(pattern: u32, len: usize) -> Vec<u8> {
+    let mut p = vec![pattern as u8; len];
+    wire::seal(&derive_key("test"), wire::TYPE_DATA, 7, &mut p);
     p
 }
 
@@ -99,7 +99,7 @@ fn socket_offloads_preserve_independent_wire_packets() {
 fn ordinary_peer_receives_segments_and_short_tail() {
     let (sender, receiver) = pair(true);
     let mut batch = Batch::new();
-    let packets = [sealed(1, 1200), sealed(2, 1200), sealed(3, 8)];
+    let packets = [sealed(1, 1200), sealed(2, 1200), sealed(3, wire::HDR_LEN)];
     for p in &packets {
         assert!(batch.push(p));
     }

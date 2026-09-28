@@ -14,6 +14,7 @@ const SERVER: [u8; 4] = [192, 0, 2, 1];
 const CLIENT: [u8; 4] = [198, 51, 100, 7];
 const REMOTE: [u8; 4] = [203, 0, 113, 9];
 const INNER: [u8; 4] = [10, 66, 0, 7];
+const TEST_ID: i64 = 4829017365182049271;
 const KEY: Key = Key { k0: 123, k1: 456 };
 const ETH: usize = 14;
 const MAC: [u8; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 8, 0];
@@ -106,10 +107,94 @@ fn frame(ip: &[u8]) -> Vec<u8> {
     }
     b
 }
+// Independent encoder allows malformed compact fields to reach XDP validation.
+fn test_data(inner: &[u8], typ: u8, id: i64, key: &Key) -> Vec<u8> {
+    let v4 = inner.first().is_some_and(|v| v >> 4 == 4);
+    let mut body = inner.to_vec();
+    if v4 {
+        let ihl = (inner[0] & 15) as usize * 4;
+        let old = u32::from_ne_bytes(inner[12..16].try_into().unwrap());
+        if let Some(off) = match inner[9] {
+            6 => Some(ihl + 16),
+            17 => Some(ihl + 6),
+            _ => None,
+        } {
+            let c = u16::from_ne_bytes(body[off..off + 2].try_into().unwrap());
+            let c = if inner[9] == 17 {
+                edup_common::csum::udp_replace4(c, old, 0)
+            } else {
+                edup_common::csum::replace4(c, old, 0)
+            };
+            body[off..off + 2].copy_from_slice(&c.to_ne_bytes());
+        }
+        let mut compact = inner[16..20].to_vec();
+        compact.extend(&inner[4..6]);
+        compact.extend([
+            (inner[6] & 0xe0) | (inner[0] & 15).saturating_sub(5),
+            inner[1],
+            inner[8],
+            inner[9],
+        ]);
+        compact.extend(&body[20..]);
+        body = compact;
+    } else if inner.len() >= 40 {
+        if let Some(off) = match inner[6] {
+            6 => Some(56),
+            17 => Some(46),
+            58 => Some(42),
+            _ => None,
+        } {
+            let check = get16(inner, off);
+            if inner[6] != 17 || check != 0 {
+                let mut sum = (!check) as u64;
+                for i in (8..24).step_by(2) {
+                    sum += (!get16(inner, i)) as u64;
+                }
+                let c = !edup_common::csum::fold(sum);
+                put16(
+                    &mut body,
+                    off,
+                    if inner[6] == 17 && c == 0 { 65535 } else { c },
+                );
+            }
+        }
+        let mut compact = inner[24..40].to_vec();
+        compact.extend([
+            inner[0] & 15,
+            inner[1],
+            inner[2],
+            inner[3],
+            inner[6],
+            inner[7],
+        ]);
+        compact.extend(&body[40..]);
+        body = compact;
+    }
+    let mut data = vec![0; wire::HDR_LEN];
+    data.extend(body);
+    let typ = if typ == wire::TYPE_DATA && !v4 && !inner.is_empty() {
+        wire::TYPE_IPV6
+    } else {
+        typ
+    };
+    wire::seal(key, typ, id, &mut data);
+    data
+}
+fn open_test<const N: usize>(key: &Key, data: &mut Vec<u8>, local: [u8; N]) -> wire::Opened {
+    let opened = wire::open(key, data).unwrap();
+    let mut ip = vec![0; data.len() + 20];
+    let n = wire::unpack(opened.typ, &data[wire::HDR_LEN..], &mut ip, &local, false).unwrap();
+    data.truncate(wire::HDR_LEN);
+    data.extend(&ip[..n]);
+    opened
+}
 fn tunnel(inner: &[u8], typ: u8, user: u16) -> Vec<u8> {
-    let mut data = vec![0; wire::HDR_LEN + inner.len()];
-    data[wire::HDR_LEN..].copy_from_slice(inner);
-    wire::seal(&KEY, 42, typ, user, &mut data);
+    let data = test_data(
+        inner,
+        typ,
+        if user == 7 { TEST_ID } else { user as i64 },
+        &KEY,
+    );
     let mut udp = vec![0; 8];
     put16(&mut udp, 0, 40000);
     put16(&mut udp, 2, 7777);
@@ -135,6 +220,15 @@ fn run(bpf: &Ebpf, input: &[u8], action: u32) -> Result<Vec<u8>, Error> {
         data_out: Some(&mut out),
         ..Default::default()
     })?;
+    if r.return_value != action {
+        let stats = PerCpuArray::<_, u64>::try_from(bpf.map("STATS").unwrap())?;
+        for (i, name) in stat::NAMES.iter().enumerate() {
+            let count: u64 = stats.get(&(i as u32), 0)?.iter().sum();
+            if count != 0 {
+                eprintln!("{name}={count}");
+            }
+        }
+    }
     assert_eq!(r.return_value, action, "unexpected XDP action");
     out.truncate(r.data_size_out as usize);
     if action == 3 {
@@ -182,12 +276,8 @@ fn main() -> Result<(), Error> {
     p.load()?;
     println!("PASS: kernel verifier");
     let cfg = Config {
-        key0: KEY.k0,
-        key1: KEY.k1,
         server_ip_be: u32::from_ne_bytes(SERVER),
         nat_ip_be: u32::from_ne_bytes(SERVER),
-        tun_net: 0x0a420000,
-        tun_mask: 0xffff0000,
         port_be: 7777u16.to_be(),
         nat_port_min: 20000,
         nat_port_max: 20100,
@@ -198,11 +288,15 @@ fn main() -> Result<(), Error> {
     Array::<_, User>::try_from(bpf.map_mut("USERS").unwrap())?.set(
         7,
         User {
+            id: TEST_ID,
+            key0: KEY.k0,
+            key1: KEY.k1,
             enabled: 1,
             ..Default::default()
         },
         0,
     )?;
+    HashMap::<_, i64, u16>::try_from(bpf.map_mut("USER_IDS").unwrap())?.insert(TEST_ID, 7, 0)?;
     if std::env::args().nth(2).as_deref() == Some("--bench") {
         return benchmark(&bpf);
     }
@@ -246,10 +340,10 @@ fn main() -> Result<(), Error> {
         assert_eq!(&received[30..34], &CLIENT);
         assert_eq!(get16(&received, 36), 40000);
         let mut data = received[42..].to_vec();
-        let opened = wire::open(&KEY, &mut data).unwrap();
-        assert_eq!(opened.user, 7);
+        let opened = open_test(&KEY, &mut data, INNER);
+        assert_eq!(opened.user, TEST_ID);
         assert_eq!(opened.typ, wire::TYPE_DATA);
-        let inner = &data[8..];
+        let inner = &data[wire::HDR_LEN..];
         verify_ip(inner);
         assert_eq!(&inner[16..20], &INNER);
         assert_eq!(inner[8], 63);
@@ -260,17 +354,17 @@ fn main() -> Result<(), Error> {
         println!("PASS: protocol {proto} SNAT/DNAT, checksums, TTL, EIM, wire compatibility");
         if proto == IPPROTO_UDP {
             let extended = Config {
-                max_frame: (wire::MAX_KS_WORDS * 8 + 32) as u16,
+                max_frame: (wire::MAX_KS_WORDS * 8 + 36) as u16,
                 ..cfg
             };
             Array::<_, Config>::try_from(bpf.map_mut("CONFIG").unwrap())?.set(0, extended, 0)?;
             // Every ciphertext tail length, plus both edges of the maximum
             // allowed packet. XDP's output checksum covers encrypted bytes.
-            for payload in (0..16).chain([1435, 1436, 1503, 1504]) {
+            for payload in (0..16).chain([1444, 1445, 1516, 1517]) {
                 let reply = transport(proto, REMOTE, SERVER, 443, public, payload);
                 let received = run(&bpf, &frame(&reply), 3)?;
                 let mut data = received[42..].to_vec();
-                wire::open(&KEY, &mut data).unwrap();
+                open_test(&KEY, &mut data, INNER);
                 verify_ip(&data[wire::HDR_LEN..]);
             }
             Array::<_, Config>::try_from(bpf.map_mut("CONFIG").unwrap())?.set(0, cfg, 0)?;
@@ -279,9 +373,7 @@ fn main() -> Result<(), Error> {
     }
 
     let inner = transport(IPPROTO_UDP, INNER, REMOTE, 1234, 443, 10);
-    let mut bad = inner.clone();
-    bad[12] = 11;
-    run(&bpf, &tunnel(&bad, 0, 7), 1)?;
+
     let mut bad = inner.clone();
     bad[8] = 1;
     run(&bpf, &tunnel(&bad, 0, 7), 1)?;
@@ -293,7 +385,7 @@ fn main() -> Result<(), Error> {
     run(&bpf, &tunnel(&inner, 2, 7), 1)?;
     run(&bpf, &tunnel(&inner, 1, 7), 1)?;
     let mut bad = tunnel(&inner, 0, 7);
-    bad[47] ^= 1;
+    bad[50] ^= 0x80;
     run(&bpf, &bad, 1)?;
     let mut bad = tunnel(&inner, 0, 7);
     put16(&mut bad, 38, 8);
@@ -301,13 +393,13 @@ fn main() -> Result<(), Error> {
     let mut bad = inner.clone();
     put16(&mut bad, 24, 8);
     run(&bpf, &tunnel(&bad, 0, 7), 1)?;
-    let large = transport(IPPROTO_UDP, INNER, REMOTE, 1234, 443, 1437);
+    let large = transport(IPPROTO_UDP, INNER, REMOTE, 1234, 443, 1446);
     run(&bpf, &tunnel(&large, 0, 7), 1)?;
-    let max = transport(IPPROTO_UDP, INNER, REMOTE, 1234, 443, 1436);
+    let max = transport(IPPROTO_UDP, INNER, REMOTE, 1234, 443, 1445);
     let out = run(&bpf, &tunnel(&max, 0, 7), 3)?;
-    assert_eq!(out.len(), ETH + 1464);
+    assert_eq!(out.len(), ETH + 1473);
     verify_ip(&out[ETH..]);
-    println!("PASS: spoof, TTL, fragments, user/header validation, MTU boundary");
+    println!("PASS: TTL, fragments, user/header validation, MTU boundary");
 
     let host = frame(&transport(IPPROTO_TCP, REMOTE, SERVER, 10000, 22, 0));
     assert_eq!(run(&bpf, &host, 2)?, host);
@@ -320,7 +412,8 @@ fn main() -> Result<(), Error> {
 
     // Simulate independent LRU eviction and expiration without waiting minutes.
     let key = NatOutKey {
-        inner_ip_be: u32::from_ne_bytes(INNER),
+        user: 7,
+        _pad: [0; 2],
         inner_port_be: 1234u16.to_be(),
         proto: IPPROTO_UDP,
         v6: 0,
@@ -429,14 +522,14 @@ fn main() -> Result<(), Error> {
     let mut padded_reply = reply.clone();
     padded_reply.resize(60, 0xa5);
     let received = run(&bpf, &padded_reply, 3)?;
-    assert_eq!(received.len(), ETH + 36 + reply_ip.len());
+    assert_eq!(received.len(), ETH + wire::OVERHEAD_V4 + reply_ip.len());
     assert_eq!(&received[30..34], &[198, 51, 100, 99]);
     assert_eq!(get16(&received, 36), 41000);
     let mut data = received[42..].to_vec();
-    wire::open(&KEY, &mut data).unwrap();
-    verify_ip(&data[8..]);
+    open_test(&KEY, &mut data, INNER);
+    verify_ip(&data[wire::HDR_LEN..]);
     let mut bad = tunnel(&inner, 0, 7);
-    bad[47] ^= 1;
+    bad[50] ^= 0x80;
     run(&bpf, &bad, 1)?;
     let after = Array::<_, User>::try_from(bpf.map("USERS").unwrap())?.get(&7, 0)?;
     assert_eq!(
@@ -447,15 +540,15 @@ fn main() -> Result<(), Error> {
         "PASS: NAT_OUT eviction, disabled/unknown endpoint, roaming, rejected packet cannot roam, inbound padding"
     );
 
-    let max_reply = transport(IPPROTO_UDP, REMOTE, SERVER, 443, public, 1436);
+    let max_reply = transport(IPPROTO_UDP, REMOTE, SERVER, 443, public, 1445);
     let received = run(&bpf, &frame(&max_reply), 3)?;
     assert_eq!(received.len(), ETH + 1500);
     let mut data = received[42..].to_vec();
-    wire::open(&KEY, &mut data).unwrap();
-    verify_ip(&data[8..]);
+    open_test(&KEY, &mut data, INNER);
+    verify_ip(&data[wire::HDR_LEN..]);
     run(
         &bpf,
-        &frame(&transport(IPPROTO_UDP, REMOTE, SERVER, 443, public, 1437)),
+        &frame(&transport(IPPROTO_UDP, REMOTE, SERVER, 443, public, 1446)),
         1,
     )?;
     // IPv4 options are preserved on inner packets; transport offsets follow IHL.
@@ -470,6 +563,58 @@ fn main() -> Result<(), Error> {
     let sent = run(&bpf, &tunnel(&options, 0, 7), 3)?;
     verify_ip(&sent[ETH..]);
     assert_eq!(&sent[34..38], &[1, 1, 1, 0]);
+    for options_len in [0, 4, 40] {
+        let prepare = |mut ip: Vec<u8>| {
+            ip.splice(20..20, vec![1; options_len]);
+            ip[0] = 0x45 + options_len as u8 / 4;
+            ip[1] = 0xab;
+            put16(&mut ip, 4, 0xdead);
+            put16(&mut ip, 6, 0x4000);
+            let len = ip.len();
+            put16(&mut ip, 2, len as u16);
+            put16(&mut ip, 10, 0);
+            let c = checksum(&ip[..20 + options_len]);
+            put16(&mut ip, 10, c);
+            ip
+        };
+        let outbound = prepare(inner.clone());
+        let mut encoded = vec![0; wire::HDR_LEN + outbound.len()];
+        encoded[wire::HDR_LEN..].copy_from_slice(&outbound);
+        let n = wire::seal_data(&KEY, TEST_ID, &mut encoded, true).unwrap();
+        encoded.truncate(n);
+        assert_eq!(
+            encoded,
+            test_data(&outbound, wire::TYPE_DATA, TEST_ID, &KEY)
+        );
+        let sent = run(&bpf, &tunnel(&outbound, 0, 7), 3)?;
+        verify_ip(&sent[ETH..]);
+        assert_eq!(sent[ETH + 1], 0xab);
+        assert_eq!(get16(&sent, ETH + 4), 0xdead);
+        assert_eq!(get16(&sent, ETH + 6), 0x4000);
+        let public = get16(&sent, ETH + 20 + options_len);
+        let reply = prepare(transport(IPPROTO_UDP, REMOTE, SERVER, 443, public, 10));
+        let returned = run(&bpf, &frame(&reply), 3)?;
+        let mut body = returned[42..].to_vec();
+        open_test(&KEY, &mut body, INNER);
+        let ip = &body[wire::HDR_LEN..];
+        verify_ip(ip);
+        assert_eq!(ip[0], 0x45 + options_len as u8 / 4);
+        assert_eq!(ip[1], 0xab);
+        assert_eq!(get16(ip, 4), 0xdead);
+        assert_eq!(get16(ip, 6), 0x4000);
+        assert_eq!(&ip[20..20 + options_len], &vec![1; options_len]);
+    }
+    for flags in [0x80, 0x20, 0x10, 11, 15] {
+        let mut bad = tunnel(&inner, 0, 7);
+        let body = &mut bad[42..];
+        wire::open(&KEY, body).unwrap();
+        body[wire::HDR_LEN + 6] = flags;
+        wire::seal(&KEY, wire::TYPE_DATA, TEST_ID, body);
+        run(&bpf, &bad, 1)?;
+    }
+    println!(
+        "PASS: client codec, DSCP/ECN, DF, identification, all IPv4 option sizes and malformed flags"
+    );
     let mut zero_udp = inner.clone();
     put16(&mut zero_udp, 26, 0);
     let sent = run(&bpf, &tunnel(&zero_udp, 0, 7), 3)?;
@@ -539,11 +684,12 @@ fn main() -> Result<(), Error> {
     for (index, name) in stat::NAMES.iter().enumerate() {
         let sum: u64 = stats.get(&(index as u32), 0)?.iter().sum();
         println!("{name}: {sum}");
-        if !matches!(index as u32, stat::DROP_ADJUST) {
+        if !matches!(index as u32, stat::DROP_ADJUST | stat::DROP_SPOOF) {
             assert!(sum > 0, "untested outcome: {name}");
         }
     }
     check_ipv6(&mut bpf, cfg)?;
+    check_multiple_users(&mut bpf, cfg)?;
     println!("All XDP integration checks passed; nothing attached or pinned.");
     Ok(())
 }
@@ -665,9 +811,12 @@ fn transport6(
     p
 }
 fn tunnel6(inner: &[u8], typ: u8, user: u16) -> Vec<u8> {
-    let mut data = vec![0; wire::HDR_LEN + inner.len()];
-    data[wire::HDR_LEN..].copy_from_slice(inner);
-    wire::seal(&KEY, 42, typ, user, &mut data);
+    let data = test_data(
+        inner,
+        typ,
+        if user == 7 { TEST_ID } else { user as i64 },
+        &KEY,
+    );
     let mut udp = vec![0; 8];
     put16(&mut udp, 0, 40000);
     put16(&mut udp, 2, 7777);
@@ -690,7 +839,6 @@ fn check_ipv6(bpf: &mut Ebpf, cfg: Config) -> Result<(), Error> {
     let cfg = Config {
         server_ip6: server,
         nat_ip6: server,
-        tun_net6: addr6("fd66::"),
         gateway_mac: [2, 1, 2, 3, 4, 5],
         gateway6_mac: [2, 6, 7, 8, 9, 10],
         ..cfg
@@ -715,12 +863,23 @@ fn check_ipv6(bpf: &mut Ebpf, cfg: Config) -> Result<(), Error> {
             if v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP },
         ] {
             for payload in [0, 1, 7, 1200] {
-                let inner = if v6 {
+                let mut inner = if v6 {
                     transport6(proto, inner6, remote, 4321, 443, payload, false)
                 } else {
                     transport(proto, INNER, REMOTE, 4321, 443, payload)
                 };
+                if v6 {
+                    inner[..4].copy_from_slice(&0x6ab54321u32.to_be_bytes());
+                    let mut encoded = vec![0; wire::HDR_LEN + inner.len()];
+                    encoded[wire::HDR_LEN..].copy_from_slice(&inner);
+                    let n = wire::seal_data(&KEY, TEST_ID, &mut encoded, true).unwrap();
+                    encoded.truncate(n);
+                    assert_eq!(encoded, test_data(&inner, wire::TYPE_DATA, TEST_ID, &KEY));
+                }
                 let sent = run(bpf, &wrap(&inner, wire::TYPE_DATA, 7), 3)?;
+                if v6 {
+                    assert_eq!(&sent[ETH..ETH + 4], &inner[..4]);
+                }
                 assert_eq!(
                     &sent[..6],
                     if v6 {
@@ -736,7 +895,7 @@ fn check_ipv6(bpf: &mut Ebpf, cfg: Config) -> Result<(), Error> {
                     0
                 };
                 let public = get16(&sent, ETH + ihl + port_offset);
-                let reply = if v6 {
+                let mut reply = if v6 {
                     assert_eq!(&sent[ETH + 8..ETH + 24], &server);
                     assert_eq!(sent[ETH + 7], 63);
                     assert_eq!(
@@ -764,6 +923,9 @@ fn check_ipv6(bpf: &mut Ebpf, cfg: Config) -> Result<(), Error> {
                         payload,
                     )
                 };
+                if v6 {
+                    reply[..4].copy_from_slice(&0x6fefedcbu32.to_be_bytes());
+                }
                 let received = run(bpf, &frame(&reply), 3)?;
                 assert_eq!(received[ETH] >> 4, if outer6 { 6 } else { 4 });
                 if outer6 {
@@ -774,11 +936,16 @@ fn check_ipv6(bpf: &mut Ebpf, cfg: Config) -> Result<(), Error> {
                     );
                 }
                 let mut data = received[ETH + hlen + 8..].to_vec();
-                let opened = wire::open(&KEY, &mut data).unwrap();
-                assert_eq!(opened.user, 7);
+                let opened = if v6 {
+                    open_test(&KEY, &mut data, inner6)
+                } else {
+                    open_test(&KEY, &mut data, INNER)
+                };
+                assert_eq!(opened.user, TEST_ID);
                 let ip = &data[wire::HDR_LEN..];
                 if v6 {
                     assert_eq!(&ip[24..40], &inner6);
+                    assert_eq!(&ip[..4], &reply[..4]);
                     assert_eq!(ip[7], 63);
                     assert_eq!(checksum(&pseudo6(ip)), 0, "NAT66 inbound checksum");
                 } else {
@@ -789,7 +956,7 @@ fn check_ipv6(bpf: &mut Ebpf, cfg: Config) -> Result<(), Error> {
         }
     }
     let valid = transport6(IPPROTO_UDP, inner6, remote, 4321, 443, 0, false);
-    for (offset, value) in [(8, 0x20), (6, 44), (6, 0), (6, 1), (7, 1), (5, 7)] {
+    for (offset, value) in [(6, 44), (6, 0), (6, 1), (7, 1)] {
         let mut bad = valid.clone();
         bad[offset] = value;
         run(bpf, &tunnel6(&bad, wire::TYPE_DATA, 7), 1)?;
@@ -813,8 +980,39 @@ fn check_ipv6(bpf: &mut Ebpf, cfg: Config) -> Result<(), Error> {
         host,
         "unmapped IPv6 host traffic passes"
     );
-    let too_big = transport6(IPPROTO_UDP, inner6, remote, 4321, 443, 1397, false);
+    let too_big = transport6(IPPROTO_UDP, inner6, remote, 4321, 443, 1414, false);
     run(bpf, &tunnel6(&too_big, wire::TYPE_DATA, 7), 1)?;
+    // Exercise every XOR tail and the exact default/maximum IPv6 wire sizes.
+    let extended = Config {
+        max_frame: 1592,
+        ..cfg
+    };
+    Array::<_, Config>::try_from(bpf.map_mut("CONFIG").unwrap())?.set(0, extended, 0)?;
+    for payload in (0..16).chain([1412, 1413, 1504, 1505]) {
+        let inner = transport6(IPPROTO_UDP, inner6, remote, 4321, 443, payload, false);
+        let sent = run(bpf, &tunnel6(&inner, wire::TYPE_DATA, 7), 3)?;
+        assert_eq!(checksum(&pseudo6(&sent[ETH..])), 0);
+        let public = get16(&sent, ETH + 40);
+        let reply = transport6(IPPROTO_UDP, remote, server, 443, public, payload, true);
+        let received = run(bpf, &frame(&reply), 3)?;
+        assert_eq!(received.len(), ETH + inner.len() + wire::OVERHEAD_V6);
+        assert_eq!(checksum(&pseudo6(&received[ETH..])), 0);
+        let mut body = received[ETH + 48..].to_vec();
+        open_test(&KEY, &mut body, inner6);
+        assert_eq!(checksum(&pseudo6(&body[wire::HDR_LEN..])), 0);
+    }
+    let too_big = transport6(IPPROTO_UDP, inner6, remote, 4321, 443, 1506, false);
+    run(bpf, &tunnel6(&too_big, wire::TYPE_DATA, 7), 1)?;
+    Array::<_, Config>::try_from(bpf.map_mut("CONFIG").unwrap())?.set(0, cfg, 0)?;
+    // Reserved bits and truncated compact metadata never update the endpoint.
+    let mut bad = tunnel6(&valid, wire::TYPE_DATA, 7);
+    let body = &mut bad[ETH + 48..];
+    wire::open(&KEY, body).unwrap();
+    body[wire::HDR_LEN + 16] |= 0x10;
+    wire::seal(&KEY, wire::TYPE_IPV6, TEST_ID, body);
+    run(bpf, &bad, 1)?;
+    run(bpf, &tunnel6(&[], wire::TYPE_IPV6, 7), 1)?;
+    println!("PASS: compact IPv6 client codec, flow label/traffic class, XOR tails and MTU bounds");
     let disabled = Config {
         nat_ip6: [0; 16],
         ..cfg
@@ -833,6 +1031,165 @@ fn check_ipv6(bpf: &mut Ebpf, cfg: Config) -> Result<(), Error> {
     )?;
     println!(
         "PASS: separate IPv4/IPv6 paths and cross-family rejection, NAT66 TCP/UDP/ICMPv6, checksums, MAC routes, roaming, malformed IPv6, MTU and NDP passthrough"
+    );
+    Ok(())
+}
+
+// Overlapping local addresses and ports must remain independent across users.
+fn check_multiple_users(bpf: &mut Ebpf, mut cfg: Config) -> Result<(), Error> {
+    cfg.server_ip6 = addr6("2001:db8::1");
+    cfg.nat_ip6 = cfg.server_ip6;
+    Array::<_, Config>::try_from(bpf.map_mut("CONFIG").unwrap())?.set(0, cfg, 0)?;
+    let second_id = TEST_ID ^ i64::MIN;
+    let second_key = Key { k0: 789, k1: 987 };
+    HashMap::<_, i64, u16>::try_from(bpf.map_mut("USER_IDS").unwrap())?.insert(second_id, 42, 0)?;
+    Array::<_, User>::try_from(bpf.map_mut("USERS").unwrap())?.set(
+        42,
+        User {
+            id: second_id,
+            key0: second_key.k0,
+            key1: second_key.k1,
+            enabled: 1,
+            ..Default::default()
+        },
+        0,
+    )?;
+    for v6 in [false, true] {
+        let hlen = if v6 { 40 } else { 20 };
+        let wrap = if v6 { tunnel6 } else { tunnel };
+        for proto in [
+            IPPROTO_TCP,
+            IPPROTO_UDP,
+            if v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP },
+        ] {
+            let echo = proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6;
+            let mut flows = Vec::new();
+            // Both users can use identical local addresses and ports.
+            {
+                let address4 = [172, 19, 8, 23];
+                let address6 = addr6("fd77:1::1234");
+                for (id, slot, key) in [(TEST_ID, 7u16, KEY), (second_id, 42, second_key)] {
+                    let inner = if v6 {
+                        transport6(
+                            proto,
+                            address6,
+                            addr6("2001:db8:2::9"),
+                            5555,
+                            443,
+                            17,
+                            false,
+                        )
+                    } else {
+                        let mut ip = transport(proto, address4, REMOTE, 5555, 443, 17);
+                        if echo {
+                            ip[20] = 8;
+                            put16(&mut ip, 22, 0);
+                            let sum = checksum(&ip[20..]);
+                            put16(&mut ip, 22, sum);
+                        }
+                        ip
+                    };
+                    let mut packet = wrap(&inner, wire::TYPE_DATA, 7);
+                    let body = &mut packet[ETH + hlen + 8..];
+                    body.copy_from_slice(&test_data(&inner, wire::TYPE_DATA, id, &key));
+                    put16(&mut packet, ETH + hlen, 40000 + slot);
+                    // Keep the test's outer UDP checksum valid after replacing its body.
+                    put16(&mut packet, ETH + hlen + 6, 0);
+                    let sum = checksum(&if v6 {
+                        pseudo6(&packet[ETH..])
+                    } else {
+                        pseudo(&packet[ETH..])
+                    });
+                    put16(
+                        &mut packet,
+                        ETH + hlen + 6,
+                        if sum == 0 { 65535 } else { sum },
+                    );
+                    let sent = run(bpf, &packet, 3)?;
+                    let port = get16(&sent, ETH + hlen + if echo { 4 } else { 0 });
+                    if v6 {
+                        assert_eq!(checksum(&pseudo6(&sent[ETH..])), 0);
+                    } else {
+                        verify_ip(&sent[ETH..]);
+                    }
+                    flows.push((id, slot, key, address4, address6, packet, port));
+                }
+            }
+            // Check all mappings AFTER the colliding tuples have been inserted.
+            for (i, (id, slot, key, address4, address6, packet, port)) in flows.iter().enumerate() {
+                assert!(
+                    flows[..i].iter().all(|f| f.6 != *port),
+                    "NAT mappings must not overlap"
+                );
+                let sent = run(bpf, packet, 3)?;
+                assert_eq!(
+                    get16(&sent, ETH + hlen + if echo { 4 } else { 0 }),
+                    *port,
+                    "another user/address must not replace this mapping"
+                );
+                let reply = if v6 {
+                    transport6(
+                        proto,
+                        addr6("2001:db8:2::9"),
+                        cfg.server_ip6,
+                        if echo { *port } else { 443 },
+                        *port,
+                        17,
+                        true,
+                    )
+                } else {
+                    transport(
+                        proto,
+                        REMOTE,
+                        SERVER,
+                        if echo { *port } else { 443 },
+                        *port,
+                        17,
+                    )
+                };
+                let returned = run(bpf, &frame(&reply), 3)?;
+                assert_eq!(get16(&returned, ETH + hlen + 2), 40000 + slot);
+                if v6 {
+                    assert_eq!(checksum(&pseudo6(&returned[ETH..])), 0);
+                }
+                let mut body = returned[ETH + hlen + 8..].to_vec();
+                let opened = if v6 {
+                    open_test(key, &mut body, *address6)
+                } else {
+                    open_test(key, &mut body, *address4)
+                };
+                assert_eq!(opened.user, *id);
+                let inner = &body[wire::HDR_LEN..];
+                if v6 {
+                    assert_eq!(&inner[24..40], address6);
+                    assert_eq!(checksum(&pseudo6(inner)), 0);
+                } else {
+                    assert_eq!(&inner[16..20], address4);
+                    verify_ip(inner);
+                }
+                assert_eq!(get16(inner, hlen + if echo { 4 } else { 2 }), 5555);
+            }
+        }
+        let before = Array::<_, User>::try_from(bpf.map("USERS").unwrap())?.get(&42, 0)?;
+        let mut wrong = wrap(&[], wire::TYPE_KEEPALIVE, 7);
+        wrong[ETH + hlen + 8..ETH + hlen + 16].copy_from_slice(&second_id.to_be_bytes());
+        run(bpf, &wrong, 1)?;
+        let after = Array::<_, User>::try_from(bpf.map("USERS").unwrap())?.get(&42, 0)?;
+        assert_eq!(after.last_seen_ns, before.last_seen_ns);
+        let counter = || -> Result<u64, Error> {
+            Ok(PerCpuArray::<_, u64>::try_from(bpf.map("STATS").unwrap())?
+                .get(&stat::DROP_UNKNOWN_USER, 0)?
+                .iter()
+                .sum())
+        };
+        let before_unknown = counter()?;
+        wrong[ETH + hlen + 8..ETH + hlen + 16].copy_from_slice(&i64::MAX.to_be_bytes());
+        wrong[ETH + hlen + 16..].fill(0);
+        run(bpf, &wrong, 1)?;
+        assert_eq!(counter()?, before_unknown + 1);
+    }
+    println!(
+        "PASS: omitted local addresses, overlapping client ports, independent TCP/UDP/ICMP NAT and reply addresses, per-user keys and unknown-ID early drop"
     );
     Ok(())
 }

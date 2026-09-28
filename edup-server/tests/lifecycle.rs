@@ -77,10 +77,10 @@ fn checksum(bytes: &[u8]) -> u16 {
 }
 fn keepalive(gen_path: &Path) {
     let prog = Xdp::from_pin(gen_path.join("program"), XdpAttachType::Interface).unwrap();
-    let mut data = [0u8; 50];
+    let mut data = [0u8; 42 + wire::HDR_LEN];
     data[..14].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 8, 0]);
     data[14] = 0x45;
-    data[16..18].copy_from_slice(&36u16.to_be_bytes());
+    data[16..18].copy_from_slice(&((28 + wire::HDR_LEN) as u16).to_be_bytes());
     data[22] = 64;
     data[23] = 17;
     data[26..30].copy_from_slice(&[198, 51, 100, 7]);
@@ -89,12 +89,11 @@ fn keepalive(gen_path: &Path) {
     data[24..26].copy_from_slice(&c.to_be_bytes());
     data[34..36].copy_from_slice(&40000u16.to_be_bytes());
     data[36..38].copy_from_slice(&7777u16.to_be_bytes());
-    data[38..40].copy_from_slice(&16u16.to_be_bytes());
+    data[38..40].copy_from_slice(&((8 + wire::HDR_LEN) as u16).to_be_bytes());
     wire::seal(
         &derive_key("replace-this-password"),
-        42,
         wire::TYPE_KEEPALIVE,
-        7,
+        4829017365182049271,
         &mut data[42..],
     );
     let mut output = [0; 128];
@@ -116,12 +115,24 @@ fn keepalive6(gen_path: &Path) {
     .unwrap()
     .get(&0, 0)
     .unwrap();
+    let slot = HashMap::<_, i64, u16>::try_from(Map::HashMap(
+        MapData::from_pin(gen_path.join("USER_IDS")).unwrap(),
+    ))
+    .unwrap()
+    .get(&4829017365182049271, 0)
+    .unwrap();
+    let user = Array::<_, User>::try_from(Map::Array(
+        MapData::from_pin(gen_path.join("USERS")).unwrap(),
+    ))
+    .unwrap()
+    .get(&(slot as u32), 0)
+    .unwrap();
     let prog = Xdp::from_pin(gen_path.join("program"), XdpAttachType::Interface).unwrap();
-    let mut data = [0u8; 70];
+    let mut data = [0u8; 62 + wire::HDR_LEN];
     data[..14].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x86, 0xdd]);
     let ip = &mut data[14..];
     ip[0] = 0x60;
-    ip[4..6].copy_from_slice(&16u16.to_be_bytes());
+    ip[4..6].copy_from_slice(&((8 + wire::HDR_LEN) as u16).to_be_bytes());
     ip[6] = 17;
     ip[7] = 64;
     ip[8..24].copy_from_slice(
@@ -133,19 +144,18 @@ fn keepalive6(gen_path: &Path) {
     ip[24..40].copy_from_slice(&cfg.server_ip6);
     ip[40..42].copy_from_slice(&40000u16.to_be_bytes());
     ip[42..44].copy_from_slice(&cfg.port_be.to_ne_bytes());
-    ip[44..46].copy_from_slice(&16u16.to_be_bytes());
+    ip[44..46].copy_from_slice(&((8 + wire::HDR_LEN) as u16).to_be_bytes());
     wire::seal(
         &wire::Key {
-            k0: cfg.key0,
-            k1: cfg.key1,
+            k0: user.key0,
+            k1: user.key1,
         },
-        42,
         wire::TYPE_KEEPALIVE,
-        7,
+        4829017365182049271,
         &mut ip[48..],
     );
     let mut pseudo = ip[8..40].to_vec();
-    pseudo.extend([0, 0, 0, 16, 0, 0, 0, 17]);
+    pseudo.extend([0, 0, 0, (8 + wire::HDR_LEN) as u8, 0, 0, 0, 17]);
     pseudo.extend(&ip[40..]);
     let sum = checksum(&pseudo);
     ip[46..48].copy_from_slice(&if sum == 0 { 0xffff } else { sum }.to_be_bytes());
@@ -158,7 +168,7 @@ fn keepalive6(gen_path: &Path) {
         })
         .unwrap();
     assert_eq!(result.return_value, 3);
-    assert_eq!(result.data_size_out, 70);
+    assert_eq!(result.data_size_out as usize, data.len());
     assert_eq!(&output[22..38], &cfg.server_ip6);
 }
 
@@ -216,7 +226,7 @@ fn isolated_lifecycle() {
     let _cleanup = Cleanup(temp.clone());
     let config = temp.join("server.toml");
     let original = format!(
-        "{}\nserver_ip6 = \"2001:db8::1\"\nnat_ip6 = \"2001:db8::1\"\ntunnel_net6 = \"fd66::/112\"\n",
+        "server_ip6 = \"2001:db8::1\"\nnat_ip6 = \"2001:db8::1\"\n{}",
         include_str!("../../config/server.example.toml").replace("eth0", "edup-test0")
     );
     fs::write(&config, &original).unwrap();
@@ -226,6 +236,13 @@ fn isolated_lifecycle() {
     let link_state = checked("ip", &["-details", "link", "show", "dev", "edup-test0"]);
     assert!(link_state.contains("prog/xdp"), "{link_state}");
     assert!(!link_state.contains("xdpgeneric"), "{link_state}");
+    let ids = HashMap::<_, i64, u16>::try_from(Map::HashMap(
+        MapData::from_pin(first.join("USER_IDS")).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(ids.get(&4829017365182049271, 0).unwrap(), 1);
+    assert_eq!(ids.get(&-738215604982170351, 0).unwrap(), 2);
+    drop(ids);
     keepalive(&first);
     assert!(server(&temp.join("missing"), "users", true).contains("198.51.100.7:40000"));
     keepalive6(&first);
@@ -268,7 +285,8 @@ fn isolated_lifecycle() {
 
     // Seed NAT so a reload checks actual removal, not just different map IDs.
     let forward = NatOutKey {
-        inner_ip_be: u32::from_ne_bytes([10, 66, 0, 7]),
+        user: 1,
+        _pad: [0; 2],
         inner_port_be: 1234u16.to_be(),
         proto: 17,
         v6: 0,
@@ -297,18 +315,21 @@ fn isolated_lifecycle() {
             v6: 0,
         },
         NatInVal {
-            inner_ip_be: forward.inner_ip_be,
-            user: 7,
+            user: 1,
             ..Default::default()
         },
         0,
     )
     .unwrap();
-    let revised = original
-        .replace("10.66.0.0", "10.67.0.0")
-        .replace("users = [7, 42]", "users = [7, 99]")
-        .replace("replace-this-password", "new-password")
-        .replace("20000", "21000");
+    // Reverse the actual user records, retaining each user's password.
+    let records: Vec<_> = original.split("[[users]]").collect();
+    let revised = format!(
+        "{}[[users]]{}[[users]]{}",
+        records[0], records[2], records[1]
+    )
+    .replace("-738215604982170351", "-1234567890123456789")
+    .replace("replace-this-password", "new-password")
+    .replace("20000", "21000");
     fs::write(&config, revised).unwrap();
     server(&config, "reload", true);
     let active = generation();
@@ -320,9 +341,9 @@ fn isolated_lifecycle() {
         "only link + active generation"
     );
     let users = server(&temp.join("missing"), "users", true);
-    assert!(users.contains("7\t10.67.0.7\t-\t-"));
-    assert!(users.contains("99\t10.67.0.99"));
-    assert!(!users.contains("42\t"));
+    assert!(users.contains("4829017365182049271\t2\t-\t-"));
+    assert!(users.contains("-1234567890123456789\t1\t"));
+    assert!(!users.contains("-738215604982170351\t"));
     assert!(server(&config, "stats", true).contains("keepalive 0"));
     let map = HashMap::<_, NatOutKey, NatOutVal>::try_from(Map::LruHashMap(
         MapData::from_pin(active.join("NAT_OUT")).unwrap(),
@@ -337,11 +358,14 @@ fn isolated_lifecycle() {
     .get(&0, 0)
     .unwrap();
     assert_eq!(raw.nat_port_min, 21000);
-    assert_eq!(raw.key0, derive_key("new-password").k0);
     let users_map =
         Array::<_, User>::try_from(Map::Array(MapData::from_pin(active.join("USERS")).unwrap()))
             .unwrap();
     assert_eq!(users_map.get(&42, 0).unwrap().enabled, 0);
+    assert_eq!(
+        users_map.get(&2, 0).unwrap().key0,
+        derive_key("new-password").k0
+    );
     drop(users_map);
     keepalive6(&active);
     assert!(server(&config, "stats", true).contains("keepalive 1"));

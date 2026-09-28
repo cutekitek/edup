@@ -48,15 +48,12 @@ fn lan_roundtrip() -> Result<()> {
         "New-NetRoute -DestinationPrefix 198.18.0.1/32 -InterfaceIndex {index} -NextHop 0.0.0.0 -RouteMetric 42762 -PolicyStore ActiveStore | Out-Null; $until=(Get-Date).AddSeconds(8); while (!(Get-NetIPAddress -InterfaceIndex {index} -AddressFamily IPv4 | Where-Object AddressState -eq Preferred)) {{if ((Get-Date) -gt $until) {{throw 'IPv4 address not ready'}}; Start-Sleep -Milliseconds 100}}"
     ));
     let key = derive_key(&cfg.password);
-    let nonce = AtomicU32::new(100);
     let counts = Counters::default();
     let stop = AtomicBool::new(false);
     let event = InterruptEvent::new()?;
     let result = std::thread::scope(|scope| -> Result<()> {
-        let tx =
-            scope.spawn(|| send_loop(&tun, &socket, &cfg, &key, &nonce, &counts, &stop, &event));
-        let rx =
-            scope.spawn(|| receive_loop(&tun, &socket, &cfg, &key, &nonce, &counts, &stop, &event));
+        let tx = scope.spawn(|| send_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event));
+        let rx = scope.spawn(|| receive_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event));
         let test = (|| -> Result<()> {
             let app = UdpSocket::bind((cfg.address()?, 0))?;
             socket2::SockRef::from(&app).set_recv_buffer_size(4 * 1024 * 1024)?;

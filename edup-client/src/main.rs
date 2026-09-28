@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::{Duration, Instant},
 };
@@ -38,6 +38,8 @@ struct Cli {
 enum Command {
     Check,
     Run,
+    /// Generate a random signed 64-bit ID and password for a new user.
+    Credentials,
 }
 
 #[derive(Default)]
@@ -73,6 +75,14 @@ impl Counters {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Credentials) {
+        let mut bytes = [0; 40];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generate credentials: {e}"))?;
+        let id = i64::from_ne_bytes(bytes[..8].try_into().unwrap());
+        let password: String = bytes[8..].iter().map(|b| format!("{b:02x}")).collect();
+        println!("user = {id}\npassword = \"{password}\"");
+        return Ok(());
+    }
     let cfg = config::Settings::load(&cli.config)?;
     match cli.command {
         Command::Check => {
@@ -86,6 +96,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Run => run(cfg),
+        Command::Credentials => unreachable!(),
     }
 }
 fn run(cfg: config::Settings) -> Result<()> {
@@ -127,9 +138,6 @@ fn run(cfg: config::Settings) -> Result<()> {
     } else {
         None
     };
-    let mut random = [0; 4];
-    getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("nonce seed: {e}"))?;
-    let nonce = AtomicU32::new(u32::from_ne_bytes(random));
     let counts = Counters::default();
     let key = derive_key(&cfg.password);
     println!(
@@ -138,12 +146,12 @@ fn run(cfg: config::Settings) -> Result<()> {
     );
     let result = std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
-            let result = send_loop(&tun, &socket, &cfg, &key, &nonce, &counts, &stop, &event);
+            let result = send_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event);
             stop.store(true, Relaxed);
             let _ = event.trigger();
             result
         });
-        let result = receive_loop(&tun, &socket, &cfg, &key, &nonce, &counts, &stop, &event);
+        let result = receive_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event);
         stop.store(true, Relaxed);
         let _ = event.trigger();
         let sent = worker
@@ -251,7 +259,6 @@ fn send_loop(
     socket: &udp::Transport,
     cfg: &config::Settings,
     key: &Key,
-    nonce: &AtomicU32,
     counts: &Counters,
     stop: &AtomicBool,
     event: &InterruptEvent,
@@ -287,13 +294,11 @@ fn send_loop(
                     continue;
                 };
                 packet::clamp_mss(payload, ihl, cfg.mtu);
-                wire::seal(
-                    key,
-                    nonce.fetch_add(1, Relaxed),
-                    wire::TYPE_DATA,
-                    cfg.user,
-                    data,
-                );
+                let Some(len) = wire::seal_data(key, cfg.user, data, true) else {
+                    counts.dropped.fetch_add(1, Relaxed);
+                    continue;
+                };
+                let data = &data[..len];
                 if !batch.push(data) {
                     flush_udp(socket, &mut batch, counts, stop)?;
                     assert!(batch.push(data));
@@ -342,12 +347,12 @@ fn receive_loop(
     socket: &udp::Transport,
     cfg: &config::Settings,
     key: &Key,
-    nonce: &AtomicU32,
     counts: &Counters,
     stop: &AtomicBool,
     event: &InterruptEvent,
 ) -> Result<()> {
     let mut buf = vec![0; udp::RECEIVE_CAPACITY];
+    let mut decoded = vec![0; cfg.mtu as usize];
     #[cfg(target_os = "windows")]
     let _ = event;
     #[cfg(target_os = "linux")]
@@ -365,13 +370,7 @@ fn receive_loop(
         }
         if Instant::now() >= next {
             let mut keepalive = [0; wire::HDR_LEN];
-            wire::seal(
-                key,
-                nonce.fetch_add(1, Relaxed),
-                wire::TYPE_KEEPALIVE,
-                cfg.user,
-                &mut keepalive,
-            );
+            wire::seal(key, wire::TYPE_KEEPALIVE, cfg.user, &mut keepalive);
             match socket.send(&keepalive) {
                 Ok(_) => {
                     counts.keepalive_sent.fetch_add(1, Relaxed);
@@ -400,7 +399,9 @@ fn receive_loop(
             if stop.load(Relaxed) {
                 break;
             }
-            if let Some(payload) = decode_packet(data, cfg, key, address, address6, counts) {
+            if let Some(payload) =
+                decode_packet(data, &mut decoded, cfg, key, address, address6, counts)
+            {
                 #[cfg(target_os = "linux")]
                 {
                     writer.push(payload);
@@ -467,8 +468,10 @@ fn flush_tun(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_packet<'a>(
-    data: &'a mut [u8],
+    data: &mut [u8],
+    decoded: &'a mut [u8],
     cfg: &config::Settings,
     key: &Key,
     address: [u8; 4],
@@ -477,6 +480,10 @@ fn decode_packet<'a>(
 ) -> Option<&'a mut [u8]> {
     let len = data.len();
     if len > cfg.mtu as usize + wire::HDR_LEN {
+        counts.dropped.fetch_add(1, Relaxed);
+        return None;
+    }
+    if wire::user_id(data) != Some(cfg.user) {
         counts.dropped.fetch_add(1, Relaxed);
         return None;
     }
@@ -492,11 +499,22 @@ fn decode_packet<'a>(
         counts.keepalive_received.fetch_add(1, Relaxed);
         return None;
     }
-    if opened.typ != wire::TYPE_DATA {
+    if opened.typ
+        != if address6.is_some() {
+            wire::TYPE_IPV6
+        } else {
+            wire::TYPE_DATA
+        }
+    {
         counts.dropped.fetch_add(1, Relaxed);
         return None;
     }
-    let payload = &mut data[wire::HDR_LEN..];
+    let local: &[u8] = address6.as_ref().map_or(&address[..], |a| &a[..]);
+    let Some(size) = wire::unpack(opened.typ, &data[wire::HDR_LEN..], decoded, local, false) else {
+        counts.dropped.fetch_add(1, Relaxed);
+        return None;
+    };
+    let payload = &mut decoded[..size];
     let Some(ihl) = packet::validate_family(payload, address, address6, false, cfg.mtu) else {
         counts.dropped.fetch_add(1, Relaxed);
         return None;
@@ -536,7 +554,7 @@ mod receive_tests {
         let key = derive_key(&cfg.password);
         let address = cfg.address().unwrap().octets();
         let mut aggregate = Vec::new();
-        for (nonce, user) in [(1, 7), (2, 42), (3, 7), (4, 7)] {
+        for (case, user) in [(1, cfg.user), (2, -42), (3, cfg.user), (4, cfg.user)] {
             let mut data = vec![0; wire::HDR_LEN + 40];
             let ip = &mut data[wire::HDR_LEN..];
             ip[0] = 0x45;
@@ -545,25 +563,39 @@ mod receive_tests {
             ip[12..16].copy_from_slice(&[203, 0, 113, 9]);
             ip[16..20].copy_from_slice(&address);
             ip[24..26].copy_from_slice(&20u16.to_be_bytes());
-            wire::seal(&key, nonce, wire::TYPE_DATA, user, &mut data);
-            if nonce == 3 {
+            let len = wire::seal_data(&key, user, &mut data, false).unwrap();
+            data.truncate(len);
+            if case == 3 {
                 data[5] ^= 1;
-            } // corrupt magic in the third segment
+            } // corrupt public user ID in the third segment
             aggregate.extend(data);
         }
         let mut keepalive = [0; wire::HDR_LEN];
-        wire::seal(&key, 5, wire::TYPE_KEEPALIVE, cfg.user, &mut keepalive);
+        wire::seal(&key, wire::TYPE_KEEPALIVE, cfg.user, &mut keepalive);
         aggregate.extend(keepalive);
         let counts = Counters::default();
         let mut accepted = 0;
-        for packet in aggregate.chunks_mut(wire::HDR_LEN + 40) {
-            accepted +=
-                usize::from(decode_packet(packet, &cfg, &key, address, None, &counts).is_some());
+        let mut decoded = vec![0; cfg.mtu as usize];
+        for packet in aggregate.chunks_mut(wire::HDR_LEN + 40 - wire::IPV4_SAVING) {
+            accepted += usize::from(
+                decode_packet(packet, &mut decoded, &cfg, &key, address, None, &counts).is_some(),
+            );
         }
         assert_eq!(accepted, 2);
         assert_eq!(counts.dropped.load(Relaxed), 2);
         assert_eq!(counts.keepalive_received.load(Relaxed), 1);
         // Concatenation without kernel segment metadata is never decoded as a batch.
-        assert!(decode_packet(&mut aggregate, &cfg, &key, address, None, &counts).is_none());
+        assert!(
+            decode_packet(
+                &mut aggregate,
+                &mut decoded,
+                &cfg,
+                &key,
+                address,
+                None,
+                &counts
+            )
+            .is_none()
+        );
     }
 }

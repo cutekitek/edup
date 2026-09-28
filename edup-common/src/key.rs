@@ -6,7 +6,7 @@ use crate::wire::Key;
 
 pub fn derive_key(password: &str) -> Key {
     let mut h = Blake2s256::new();
-    h.update(b"edup v1 obfuscation key\0");
+    h.update(b"edup v4 obfuscation key\0");
     h.update(password.as_bytes());
     let out = h.finalize();
     let word = |i: usize| u64::from_le_bytes(out[i..i + 8].try_into().unwrap());
