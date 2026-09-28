@@ -1,0 +1,108 @@
+name: Build executables
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.package }} (${{ matrix.platform }}-x64)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            package: edup-client
+            config: client
+            extension: .exe
+          - os: ubuntu-22.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            package: edup-client
+            config: client
+            extension: ''
+          - os: ubuntu-22.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            package: edup-server
+            config: server
+            extension: ''
+    defaults:
+      run:
+        shell: bash
+    env:
+      PACKAGE: ${{ matrix.package }}
+      TARGET: ${{ matrix.target }}
+      CONFIG: ${{ matrix.config }}
+      EXTENSION: ${{ matrix.extension }}
+      ARCHIVE_NAME: ${{ matrix.package }}-${{ matrix.platform }}-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target "$TARGET"
+
+      - name: Install eBPF toolchain and linker
+        if: matrix.package == 'edup-server'
+        # Keep these versions in sync with edup-server/build.rs and README.md.
+        run: |
+          rustup toolchain install nightly-2026-09-26 --profile minimal --component rust-src
+          curl --fail --location --retry 3 \
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+            --output "$RUNNER_TEMP/bpf-linker.tar.zst"
+          echo "e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/bpf-linker"
+          tar --zstd -xf "$RUNNER_TEMP/bpf-linker.tar.zst" -C "$RUNNER_TEMP/bpf-linker"
+          echo "$RUNNER_TEMP/bpf-linker" >> "$GITHUB_PATH"
+
+      - name: Build release executable
+        run: cargo +stable build --locked --release --target "$TARGET" -p "$PACKAGE"
+
+      - name: Validate example configuration
+        run: '"target/$TARGET/release/$PACKAGE$EXTENSION" --config "config/$CONFIG.example.toml" check'
+
+      - name: Stage package
+        run: |
+          mkdir -p "dist/$ARCHIVE_NAME"
+          cp "target/$TARGET/release/$PACKAGE$EXTENSION" "dist/$ARCHIVE_NAME/"
+          cp "config/$CONFIG.example.toml" README.md "dist/$ARCHIVE_NAME/"
+          if [ "$PACKAGE" = edup-server ]; then
+            cp -r deploy "dist/$ARCHIVE_NAME/"
+          fi
+
+      - name: Archive Linux package
+        if: runner.os == 'Linux'
+        # Preserve executable permissions when downloaded from Actions.
+        run: tar -czf "dist/$ARCHIVE_NAME.tar.gz" -C dist "$ARCHIVE_NAME"
+
+      - name: Archive Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/$env:ARCHIVE_NAME" -DestinationPath "dist/$env:ARCHIVE_NAME.zip"
+
+      - name: Upload executable package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
