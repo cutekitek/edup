@@ -13,6 +13,7 @@ edup-common = { workspace = true, features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya.workspace = true
+getrandom = "0.3"
 libc.workspace = true
 edup-common = { workspace = true, features = ["aya"] }
 

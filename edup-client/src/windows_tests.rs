@@ -146,14 +146,14 @@ fn live_offload() -> Result<()> {
     ps(&format!(
         "foreach ($p in @('1.1.1.1/32','104.16.0.35/32')) {{New-NetRoute -DestinationPrefix $p -InterfaceIndex {index} -NextHop 0.0.0.0 -RouteMetric 42761 -PolicyStore ActiveStore | Out-Null}}; $until=(Get-Date).AddSeconds(8); while (!(Get-NetIPAddress -InterfaceIndex {index} -AddressFamily IPv4 | Where-Object AddressState -eq Preferred)) {{if ((Get-Date) -gt $until) {{throw 'IPv4 address not ready'}}; Start-Sleep -Milliseconds 100}}"
     ));
-    let key = derive_key(&cfg.password);
+    let link = session::Link::new(cfg.user, &cfg.password);
     let counts = Counters::default();
     let stop = AtomicBool::new(false);
     let event = InterruptEvent::new()?;
     let result = std::thread::scope(|scope| -> Result<()> {
-        let send = scope.spawn(|| send_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event));
+        let send = scope.spawn(|| send_loop(&tun, &socket, &cfg, &link, &counts, &stop, &event));
         let receive =
-            scope.spawn(|| receive_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event));
+            scope.spawn(|| receive_loop(&tun, &socket, &cfg, &link, &counts, &stop, &event));
         let test = (|| -> Result<()> {
             let dns = UdpSocket::bind((cfg.address()?, 0))?;
             dns.set_read_timeout(Some(Duration::from_secs(5)))?;

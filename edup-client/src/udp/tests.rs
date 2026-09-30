@@ -1,5 +1,8 @@
 use super::*;
-use edup_common::{key::derive_key, wire};
+use edup_common::{
+    aead::Cipher,
+    wire::{self, Header},
+};
 use std::time::Duration;
 
 fn pair(offload: bool) -> (Transport, Transport) {
@@ -14,9 +17,17 @@ fn pair(offload: bool) -> (Transport, Transport) {
         Transport::new(b, offload).unwrap(),
     )
 }
+const KEY: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 fn sealed(pattern: u32, len: usize) -> Vec<u8> {
     let mut p = vec![pattern as u8; len];
-    wire::seal(&derive_key("test"), wire::TYPE_DATA, 7, &mut p);
+    let header = Header {
+        user: 7,
+        typ: wire::TYPE_DATA,
+        phase: 0,
+        counter: pattern as u64,
+    };
+    p[..wire::AAD_LEN].copy_from_slice(&header.encode());
+    Cipher::new(&KEY).seal(wire::TO_SERVER, &mut p);
     p
 }
 
@@ -72,7 +83,7 @@ fn socket_offloads_preserve_independent_wire_packets() {
             let (n, stride) = receiver.recv(&mut buf).unwrap();
             for segment in buf[..n].chunks_mut(stride) {
                 assert_eq!(segment, expected[seen].as_slice());
-                let opened = wire::open(&derive_key("test"), segment).unwrap();
+                let opened = Cipher::new(&KEY).open(wire::TO_SERVER, segment).unwrap();
                 assert_eq!(opened.user, 7);
                 assert!(
                     segment[wire::HDR_LEN..]

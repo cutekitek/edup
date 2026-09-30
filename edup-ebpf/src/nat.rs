@@ -1,20 +1,10 @@
 //! NAT_IN owns the lifetime; NAT_OUT is an index, never an authority.
 //! Both directions cross-check ownership because either LRU can evict alone.
-use crate::{NAT_IN, NAT_OUT};
+use crate::{NAT_IN, NAT_OUT, packet::compare_exchange};
 use aya_ebpf::bindings::BPF_NOEXIST;
-use core::intrinsics::{AtomicOrdering, atomic_cxchg};
-use edup_common::{maps::*, wire::mix64};
+use edup_common::maps::*;
 
 const PROBES: u32 = 64;
-
-// BPF has cmpxchg (ISA v3), but Rust's target does not expose atomic CAS in core.
-#[inline(always)]
-unsafe fn compare_exchange(ptr: *mut u64, old: u64, new: u64) -> bool {
-    unsafe {
-        atomic_cxchg::<u64, { AtomicOrdering::Relaxed }, { AtomicOrdering::Relaxed }>(ptr, old, new)
-            .1
-    }
-}
 
 #[inline(always)]
 fn state(proto: u8, previous: u8, flags: u8) -> u8 {

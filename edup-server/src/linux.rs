@@ -5,14 +5,14 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use aya::{
-    Ebpf,
+    Ebpf, EbpfLoader,
     maps::{Array, HashMap, Map, MapData, PerCpuArray, ProgramArray},
     programs::{
         Xdp,
         links::{FdLink, LinkType, PinnedLink},
     },
 };
-use edup_common::maps::{Config, Endpoint, MAX_USERS, User, stat};
+use edup_common::maps::{Config, Endpoint, MAX_USERS, User, program, stat};
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
@@ -25,15 +25,17 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const MAPS: [&str; 8] = [
+const MAPS: [&str; 10] = [
     "CONFIG",
     "USERS",
     "USER_IDS",
+    "SESSIONS",
     "ENDPOINTS",
     "NAT_OUT",
     "NAT_IN",
     "STATS",
     "PROTOCOLS",
+    "PASSES",
 ];
 const OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/edup-ebpf"));
 
@@ -233,21 +235,31 @@ fn live(root: &Path) -> Result<(Generation, FdLink)> {
 }
 
 fn load(cfg: &Settings) -> Result<Ebpf> {
-    let mut bpf = Ebpf::load(OBJECT).context("load embedded eBPF object")?;
+    // Two session slots per user index; index 0 is unused.
+    let sessions = (cfg.users.len() as u32 + 1) * 2;
+    let mut bpf = EbpfLoader::new()
+        .map_max_entries("SESSIONS", sessions)
+        .load(OBJECT)
+        .context("load embedded eBPF object")?;
+    // A fresh salt per load makes every server handshake nonce new, so no
+    // session from before an up or reload can be established again.
+    let mut salt = [0; 8];
+    getrandom::fill(&mut salt).map_err(|e| anyhow::anyhow!("generate salt: {e}"))?;
     Array::<_, Config>::try_from(bpf.map_mut("CONFIG").context("missing CONFIG")?)?.set(
         0,
-        cfg.map_config()?,
+        Config {
+            salt: u64::from_ne_bytes(salt),
+            ..cfg.map_config()?
+        },
         0,
     )?;
     for (index, user) in cfg.users.iter().enumerate() {
         let slot = (index + 1) as u16;
-        let key = edup_common::key::derive_key(&user.password);
         Array::<_, User>::try_from(bpf.map_mut("USERS").context("missing USERS")?)?.set(
             slot as u32,
             User {
                 id: user.id,
-                key0: key.k0,
-                key1: key.k1,
+                key: edup_common::key::derive_key(&user.password),
                 enabled: 1,
                 ..Default::default()
             },
@@ -258,7 +270,7 @@ fn load(cfg: &Settings) -> Result<Ebpf> {
     }
     // Populate and pin the program array with this generation's protocol
     // programs before attaching the dispatcher. Reload swaps the whole graph.
-    for (index, name) in ["edup_ipv4", "edup_ipv6"].into_iter().enumerate() {
+    for (index, name) in program::NAMES.into_iter().enumerate() {
         let prog: &mut Xdp = bpf
             .program_mut(name)
             .with_context(|| format!("missing {name}"))?

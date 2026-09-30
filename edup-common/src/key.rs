@@ -1,19 +1,16 @@
-//! Вывод ключа обфускации из пароля (только userspace).
+//! Long-term user key derivation from the configured password (userspace only).
 
 use blake2::{Blake2s256, Digest};
 
-use crate::wire::Key;
+use crate::crypto::{self, Key};
 
+/// A fast hash, not a password KDF: use generated passwords (`edup-client
+/// credentials`). Captured handshakes allow offline guessing of weak ones.
 pub fn derive_key(password: &str) -> Key {
     let mut h = Blake2s256::new();
-    h.update(b"edup v4 obfuscation key\0");
+    h.update(b"edup v5 user key\0");
     h.update(password.as_bytes());
-    let out = h.finalize();
-    let word = |i: usize| u64::from_le_bytes(out[i..i + 8].try_into().unwrap());
-    Key {
-        k0: word(0),
-        k1: word(8),
-    }
+    crypto::key_words(&h.finalize().into())
 }
 
 #[cfg(test)]

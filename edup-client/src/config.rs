@@ -40,7 +40,7 @@ fn interface() -> String {
     "edup0".into()
 }
 fn mtu() -> u16 {
-    1473
+    (1500 - wire::OVERHEAD_V4) as u16
 }
 fn keepalive() -> u64 {
     15
@@ -111,7 +111,8 @@ impl Settings {
                     .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
             "invalid interface name (use 1..15 ASCII letters, digits, _ or -)"
         );
-        let max_mtu = wire::MAX_KS_WORDS as usize * 8 - wire::CONTROL_LEN
+        // The ciphertext (compact inner packet) is bounded by the XDP loops.
+        let max_mtu = wire::MAX_BODY
             + if self.server.is_ipv6() {
                 wire::IPV6_SAVING
             } else {
@@ -159,7 +160,8 @@ mod tests {
         let c = cfg();
         c.validate().unwrap();
         assert_eq!(c.address().unwrap(), Ipv4Addr::new(10, 66, 0, 7));
-        assert_eq!(c.mtu, 1473);
+        assert_eq!(c.mtu, 1450);
+        assert_eq!(c.mtu, mtu());
         assert!(c.offload);
         let legacy: Settings = toml::from_str(
             &include_str!("../../config/client.example.toml").replace("offload = true", ""),
@@ -198,7 +200,7 @@ mod tests {
     }
     #[test]
     fn invalid_configuration() {
-        for mtu in [0, 575, 1546] {
+        for mtu in [0, 575, (wire::MAX_BODY + wire::IPV4_SAVING + 1) as u16] {
             let mut c = cfg();
             c.mtu = mtu;
             assert!(c.validate().is_err());
@@ -221,7 +223,7 @@ mod tests {
         let mut c = cfg();
         c.server = "[2001:db8::1]:7777".parse().unwrap();
         c.tunnel_ip6 = "fd66::7".parse().unwrap();
-        c.mtu = 1461;
+        c.mtu = (1500 - wire::OVERHEAD_V6) as u16;
         c.validate().unwrap();
         assert_eq!(
             c.address6().unwrap().unwrap(),

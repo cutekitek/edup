@@ -1,11 +1,18 @@
-//! Wire v4: [8-byte signed user ID, big-endian][XOR type + payload].
-//! Type 0: compact IPv4, type 1: keepalive, type 2: compact IPv6.
+//! Wire v5: `[user ID][type][flags][counter][tag][ciphertext]`, see
+//! docs/protocol-v5.md. The first 16 bytes are ChaCha20-Poly1305 associated
+//! data: the big-endian signed user ID, a type byte, a flags byte (bit 0 is
+//! the session key phase) and a 48-bit big-endian packet counter. The 16-byte
+//! Poly1305 tag follows, then the encrypted compact IP body.
 //! Compact IP omits the local address; its L4 checksum assumes address zero.
-//! There is no nonce; the repeating XOR stream is obfuscation, not authentication.
 
 pub const USER_ID_LEN: usize = 8;
-pub const CONTROL_LEN: usize = 1;
-pub const HDR_LEN: usize = USER_ID_LEN + CONTROL_LEN;
+/// Authenticated cleartext header: user ID, type, flags, counter.
+pub const AAD_LEN: usize = 16;
+pub const TAG_LEN: usize = 16;
+pub const HDR_LEN: usize = AAD_LEN + TAG_LEN;
+/// Handshake packets carry a 16-byte nonce contribution after the tag.
+pub const NONCE_LEN: usize = 16;
+pub const HANDSHAKE_LEN: usize = HDR_LEN + NONCE_LEN;
 pub const IPV4_META_LEN: usize = 10;
 pub const IPV4_SAVING: usize = 20 - IPV4_META_LEN;
 /// Outer IPv4 + UDP + wire header minus omitted inner IPv4 bytes.
@@ -17,103 +24,64 @@ pub const OVERHEAD_V6: usize = 40 + 8 + HDR_LEN - IPV6_SAVING;
 pub const TYPE_DATA: u8 = 0;
 pub const TYPE_KEEPALIVE: u8 = 1;
 pub const TYPE_IPV6: u8 = 2;
+pub const TYPE_INIT: u8 = 3;
+pub const TYPE_RESPONSE: u8 = 4;
 
-/// Максимум 8-байтных слов потока ключа на пакет. Покрывает область до 1536 байт,
-/// то есть внешний MTU 1500 с запасом. Ограничение нужно верификатору.
-pub const MAX_KS_WORDS: u32 = 192;
+pub const FLAG_PHASE: u8 = 1;
+pub const MAX_COUNTER: u64 = (1 << 48) - 1;
 
-const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Nonce direction words: the two directions of a session share one key.
+pub const TO_SERVER: u32 = 0;
+pub const TO_CLIENT: u32 = 1;
 
-/// 128-битный ключ, выведенный из пароля (см. [`crate::key`]).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Key {
-    pub k0: u64,
-    pub k1: u64,
+/// Largest ciphertext. Bounds the XDP loops (24 ChaCha20 blocks) and covers
+/// an outer MTU of 1500 with room to spare.
+pub const MAX_BODY: usize = 1536;
+
+/// Decoded cleartext header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub user: i64,
+    pub typ: u8,
+    /// Session key phase, 0 or 1.
+    pub phase: u8,
+    pub counter: u64,
 }
 
-/// Финализатор SplitMix64.
-#[inline(always)]
-pub const fn mix64(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+impl Header {
+    pub fn encode(&self) -> [u8; AAD_LEN] {
+        let mut out = [0; AAD_LEN];
+        out[..8].copy_from_slice(&self.user.to_be_bytes());
+        out[8] = self.typ;
+        out[9] = self.phase;
+        out[10..].copy_from_slice(&self.counter.to_be_bytes()[2..]);
+        out
+    }
+
+    /// Rejects truncation, unknown types and reserved flags.
+    pub fn decode(pkt: &[u8]) -> Option<Self> {
+        let b = pkt.get(..AAD_LEN)?;
+        let mut counter = [0; 8];
+        counter[2..].copy_from_slice(&b[10..16]);
+        let header = Self {
+            user: i64::from_be_bytes(b[..8].try_into().ok()?),
+            typ: b[8],
+            phase: b[9],
+            counter: u64::from_be_bytes(counter),
+        };
+        (header.typ <= TYPE_RESPONSE && header.phase & !FLAG_PHASE == 0).then_some(header)
+    }
 }
 
-/// Fixed password-derived stream seed.
-#[inline(always)]
-pub const fn ks_seed(key: &Key) -> u64 {
-    key.k0 ^ mix64(key.k1)
-}
-
-/// Слово `i` потока ключа.
-#[inline(always)]
-pub const fn ks_word(seed: u64, i: u32) -> u64 {
-    mix64(seed.wrapping_add((i as u64 + 1).wrapping_mul(GOLDEN)))
-}
-
-/// Read the public routing ID without touching the XOR region.
+/// Read the public routing ID before any cryptographic work.
 pub fn user_id(pkt: &[u8]) -> Option<i64> {
     Some(i64::from_be_bytes(pkt.get(..USER_ID_LEN)?.try_into().ok()?))
 }
 
-/// Reversible XOR using the same password-derived stream for every packet.
-pub fn xor_region(key: &Key, region: &mut [u8]) {
-    let seed = ks_seed(key);
-    let (chunks, tail) = region.as_chunks_mut::<8>();
-    let full = chunks.len();
-    for (i, chunk) in chunks.iter_mut().enumerate() {
-        // Fixed-size loads let LLVM use a word XOR instead of a partial-byte
-        // loop. Byte-array loads/stores also work on unaligned buffers.
-        let value = u64::from_le_bytes(*chunk);
-        *chunk = (value ^ ks_word(seed, i as u32)).to_le_bytes();
-    }
-    if !tail.is_empty() {
-        let ks = ks_word(seed, full as u32).to_le_bytes();
-        for (b, k) in tail.iter_mut().zip(ks) {
-            *b ^= k;
-        }
-    }
-}
-
-/// Seal an already encoded body at `pkt[HDR_LEN..]` with a one-byte type.
-/// Use `seal_data` to compact a complete IP packet first.
-pub fn seal(key: &Key, typ: u8, user: i64, pkt: &mut [u8]) {
-    assert!(pkt.len() >= HDR_LEN);
-    pkt[..USER_ID_LEN].copy_from_slice(&user.to_be_bytes());
-    pkt[USER_ID_LEN] = typ;
-    xor_region(key, &mut pkt[USER_ID_LEN..]);
-}
-
-/// Decoded control header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Opened {
-    pub typ: u8,
-    pub flags: u8,
-    pub user: i64,
-}
-
-/// Деобфусцирует пакет на месте. Полезная нагрузка — `pkt[HDR_LEN..]`.
-/// Returns `None` for truncated packets or unknown types;
-/// в этом случае содержимое буфера не определено.
-pub fn open(key: &Key, pkt: &mut [u8]) -> Option<Opened> {
-    if pkt.len() < HDR_LEN {
-        return None;
-    }
-    let user = user_id(pkt)?;
-    xor_region(key, &mut pkt[USER_ID_LEN..]);
-    let typ = pkt[USER_ID_LEN];
-    if typ > TYPE_IPV6 {
-        return None;
-    }
-    let flags = 0;
-    Some(Opened { typ, flags, user })
-}
-
-/// Pack and seal an IP packet already placed at `pkt[HDR_LEN..]`.
-/// Returns the datagram length. IPv4 loses 10 bytes; IPv6 loses 18 bytes.
+/// Compact an IP packet placed at `pkt[HDR_LEN..]` in place, before sealing.
+/// Returns the packet type and datagram length. IPv4 loses 10 bytes; IPv6 18.
 /// `to_server` chooses which address is local (source outbound, destination inbound).
-pub fn seal_data(key: &Key, user: i64, pkt: &mut [u8], to_server: bool) -> Option<usize> {
+pub fn compact(pkt: &mut [u8], to_server: bool) -> Option<(u8, usize)> {
     let ip = pkt.get_mut(HDR_LEN..)?;
     let typ = match ip.first()? >> 4 {
         4 => {
@@ -168,8 +136,7 @@ pub fn seal_data(key: &Key, user: i64, pkt: &mut [u8], to_server: bool) -> Optio
         } else {
             IPV6_SAVING
         };
-    seal(key, typ, user, &mut pkt[..len]);
-    Some(len)
+    Some((typ, len))
 }
 
 /// Reconstruct the decrypted payload. The local address is supplied by the
@@ -296,11 +263,6 @@ fn replace_local_checksum6(ip: &mut [u8], old: &[u8; 16], new: &[u8; 16]) -> Opt
 mod tests {
     use super::*;
 
-    const KEY: Key = Key {
-        k0: 0x0123_4567_89ab_cdef,
-        k1: 0xfedc_ba98_7654_3210,
-    };
-
     fn sum(bytes: &[u8]) -> u16 {
         let total: u64 = bytes
             .chunks(2)
@@ -378,9 +340,8 @@ mod tests {
                         let n = fixture(&mut original, local, proto, options, to_server, df);
                         let mut packet = [0; 160];
                         packet[HDR_LEN..HDR_LEN + n].copy_from_slice(&original[..n]);
-                        let len =
-                            seal_data(&KEY, -42, &mut packet[..HDR_LEN + n], to_server).unwrap();
-                        assert_eq!(len, n - 1); // 9-byte envelope minus 10 omitted bytes.
+                        let (typ, len) = compact(&mut packet[..HDR_LEN + n], to_server).unwrap();
+                        assert_eq!(len, n + HDR_LEN - IPV4_SAVING);
                         let mut different = [0; 160];
                         fixture(
                             &mut different[HDR_LEN..],
@@ -390,33 +351,21 @@ mod tests {
                             to_server,
                             df,
                         );
-                        let other_len =
-                            seal_data(&KEY, -42, &mut different[..HDR_LEN + n], to_server).unwrap();
+                        let (_, other_len) =
+                            compact(&mut different[..HDR_LEN + n], to_server).unwrap();
                         assert_eq!(
                             &packet[..len],
                             &different[..other_len],
                             "wire must not depend on local address"
                         );
-                        let opened = open(&KEY, &mut packet[..len]).unwrap();
-                        assert_eq!(opened.typ, TYPE_DATA);
+                        assert_eq!(typ, TYPE_DATA);
                         let mut decoded = [0; 128];
-                        let count = unpack(
-                            opened.typ,
-                            &packet[HDR_LEN..len],
-                            &mut decoded,
-                            &local,
-                            to_server,
-                        )
-                        .unwrap();
+                        let count =
+                            unpack(typ, &packet[HDR_LEN..len], &mut decoded, &local, to_server)
+                                .unwrap();
                         assert_eq!(&decoded[..count], &original[..n]);
-                        unpack(
-                            opened.typ,
-                            &packet[HDR_LEN..len],
-                            &mut decoded,
-                            &[0; 4],
-                            to_server,
-                        )
-                        .unwrap();
+                        unpack(typ, &packet[HDR_LEN..len], &mut decoded, &[0; 4], to_server)
+                            .unwrap();
                         assert_eq!(check_l4(&decoded[..n]), 0);
                         assert_eq!(sum(&decoded[..20 + options]), 0);
                     }
@@ -439,15 +388,14 @@ mod tests {
         let mut data = [0; 160];
         let n = fixture(&mut data[HDR_LEN..], [10, 1, 1, 1], 17, 0, true, 0);
         data[HDR_LEN + 7] = 1;
-        assert!(seal_data(&KEY, 1, &mut data[..HDR_LEN + n], true).is_none());
+        assert!(compact(&mut data[..HDR_LEN + n], true).is_none());
     }
     #[test]
     fn compact_preserves_absent_udp_checksum() {
         let mut data = [0; 160];
         let n = fixture(&mut data[HDR_LEN..], [10, 1, 1, 1], 17, 0, true, 0);
         data[HDR_LEN + 26..HDR_LEN + 28].fill(0);
-        let len = seal_data(&KEY, 1, &mut data[..HDR_LEN + n], true).unwrap();
-        open(&KEY, &mut data[..len]).unwrap();
+        let (_, len) = compact(&mut data[..HDR_LEN + n], true).unwrap();
         let mut out = [0; 128];
         unpack(
             TYPE_DATA,
@@ -517,15 +465,13 @@ mod tests {
                     let n = fixture6(&mut original, local, proto, to_server, flow);
                     let mut packet = [0; 160];
                     packet[HDR_LEN..HDR_LEN + n].copy_from_slice(&original[..n]);
-                    let len = seal_data(&KEY, -42, &mut packet[..HDR_LEN + n], to_server).unwrap();
+                    let (typ, len) = compact(&mut packet[..HDR_LEN + n], to_server).unwrap();
                     assert_eq!(len, n + HDR_LEN - IPV6_SAVING);
                     let mut different = [0; 160];
                     fixture6(&mut different[HDR_LEN..], other, proto, to_server, flow);
-                    let other_len =
-                        seal_data(&KEY, -42, &mut different[..HDR_LEN + n], to_server).unwrap();
+                    let (_, other_len) = compact(&mut different[..HDR_LEN + n], to_server).unwrap();
                     assert_eq!(&packet[..len], &different[..other_len]);
-                    let opened = open(&KEY, &mut packet[..len]).unwrap();
-                    assert_eq!(opened.typ, TYPE_IPV6);
+                    assert_eq!(typ, TYPE_IPV6);
                     assert_eq!(&packet[HDR_LEN + 16..HDR_LEN + 20], &flow.to_be_bytes());
                     let mut decoded = [0; 128];
                     let count = unpack(
@@ -558,17 +504,16 @@ mod tests {
         for proto in [0, 43, 44, 50, 51, 60, 59, 1] {
             packet = original;
             packet[HDR_LEN + 6] = proto;
-            assert!(seal_data(&KEY, 1, &mut packet[..HDR_LEN + n], true).is_none());
+            assert!(compact(&mut packet[..HDR_LEN + n], true).is_none());
         }
         packet = original;
         packet[HDR_LEN + 46..HDR_LEN + 48].fill(0);
-        assert!(seal_data(&KEY, 1, &mut packet[..HDR_LEN + n], true).is_none());
+        assert!(compact(&mut packet[..HDR_LEN + n], true).is_none());
         packet = original;
         packet[HDR_LEN + 5] ^= 1;
-        assert!(seal_data(&KEY, 1, &mut packet[..HDR_LEN + n], true).is_none());
+        assert!(compact(&mut packet[..HDR_LEN + n], true).is_none());
         packet = original;
-        let len = seal_data(&KEY, 1, &mut packet[..HDR_LEN + n], true).unwrap();
-        open(&KEY, &mut packet[..len]).unwrap();
+        let (_, len) = compact(&mut packet[..HDR_LEN + n], true).unwrap();
         let body = &packet[HDR_LEN..len];
         let mut out = [0; 128];
         for count in 0..IPV6_META_LEN + 8 {
@@ -605,8 +550,7 @@ mod tests {
         ip[8..24].copy_from_slice(&local);
         let check = check_l4_6(ip);
         ip[46..48].copy_from_slice(&check.to_be_bytes());
-        let len = seal_data(&KEY, 1, &mut data[..HDR_LEN + n], true).unwrap();
-        open(&KEY, &mut data[..len]).unwrap();
+        let (_, len) = compact(&mut data[..HDR_LEN + n], true).unwrap();
         assert_eq!(
             &data[HDR_LEN + IPV6_META_LEN + 6..HDR_LEN + IPV6_META_LEN + 8],
             &[0xff, 0xff]
@@ -617,86 +561,45 @@ mod tests {
     }
 
     #[test]
-    fn word_xor_matches_original_wire_at_every_length_and_alignment() {
-        // A roundtrip alone could hide a change made to both seal and open.
-        // Compare against the original byte implementation, including tails.
-        for offset in 0..8 {
-            for len in 0..=MAX_KS_WORDS as usize * 8 {
-                let mut actual = [0xa5; MAX_KS_WORDS as usize * 8 + 16];
-                let mut expected = actual;
-                let seed = ks_seed(&KEY);
-                for (i, b) in expected[offset..offset + len].iter_mut().enumerate() {
-                    *b ^= (ks_word(seed, (i / 8) as u32) >> ((i % 8) * 8)) as u8;
-                }
-                xor_region(&KEY, &mut actual[offset..offset + len]);
-                assert_eq!(actual, expected, "offset={offset}, len={len}");
-            }
+    fn header_layout_roundtrip_and_validation() {
+        for (user, typ, phase, counter) in [
+            (i64::MIN, TYPE_DATA, 0, 1),
+            (-1, TYPE_KEEPALIVE, 1, MAX_COUNTER),
+            (0x1234_5678_9abc_def0, TYPE_RESPONSE, 1, 0x0102_0304_0506),
+        ] {
+            let header = Header {
+                user,
+                typ,
+                phase,
+                counter,
+            };
+            let bytes = header.encode();
+            assert_eq!(&bytes[..8], &user.to_be_bytes());
+            assert_eq!(bytes[8], typ);
+            assert_eq!(bytes[9], phase);
+            assert_eq!(&bytes[10..], &counter.to_be_bytes()[2..]);
+            assert_eq!(Header::decode(&bytes), Some(header));
+            assert_eq!(user_id(&bytes), Some(user));
         }
-    }
-
-    #[test]
-    fn seal_open_roundtrip() {
-        for len in [0usize, 1, 7, 8, 9, 20, 1464] {
-            let payload: [u8; 1464] = core::array::from_fn(|i| (i * 7) as u8);
-            let mut buf = [0u8; HDR_LEN + 1464];
-            buf[HDR_LEN..HDR_LEN + len].copy_from_slice(&payload[..len]);
-            let pkt = &mut buf[..HDR_LEN + len];
-            seal(&KEY, TYPE_DATA, 0x0102, pkt);
-            if len >= 16 {
-                assert_ne!(
-                    &pkt[HDR_LEN..],
-                    &payload[..len],
-                    "payload must be scrambled"
-                );
-            }
-            let o = open(&KEY, pkt).expect("valid packet");
-            assert_eq!(
-                o,
-                Opened {
-                    typ: TYPE_DATA,
-                    flags: 0,
-                    user: 0x0102
-                }
-            );
-            assert_eq!(&pkt[HDR_LEN..], &payload[..len]);
+        let valid = Header {
+            user: 7,
+            typ: TYPE_DATA,
+            phase: 0,
+            counter: 1,
         }
-    }
-
-    #[test]
-    fn wrong_key_is_rejected() {
-        let mut pkt = [0u8; HDR_LEN + 20];
-        seal(&KEY, TYPE_KEEPALIVE, 7, &mut pkt);
-        let other = Key { k0: 1, k1: 2 };
-        // Header validation is only a format check, not authentication.
-        assert!(open(&other, &mut pkt).is_none());
-    }
-
-    #[test]
-    fn public_id_and_exact_layout() {
-        for id in [i64::MIN, -1, 0, 0x1234_5678_9abc_def0, i64::MAX] {
-            let mut pkt = [0; HDR_LEN + 1];
-            pkt[HDR_LEN] = 0x45;
-            seal(&KEY, TYPE_DATA, id, &mut pkt);
-            assert_eq!(&pkt[..8], &id.to_be_bytes());
-            assert_eq!(user_id(&pkt), Some(id));
-            let stream = ks_word(ks_seed(&KEY), 0).to_le_bytes();
-            for (i, byte) in [0, 0x45].into_iter().enumerate() {
-                assert_eq!(pkt[8 + i], byte ^ stream[i]);
-            }
-            assert_eq!(open(&KEY, &mut pkt).unwrap().user, id);
-            assert_eq!(pkt[HDR_LEN], 0x45);
+        .encode();
+        for len in 0..AAD_LEN {
+            assert!(Header::decode(&valid[..len]).is_none());
         }
-    }
-
-    #[test]
-    fn rejects_truncation_and_invalid_control() {
-        for len in 0..HDR_LEN {
-            assert!(open(&KEY, &mut [0; HDR_LEN][..len]).is_none());
+        for typ in TYPE_RESPONSE + 1..=255 {
+            let mut bad = valid;
+            bad[8] = typ;
+            assert!(Header::decode(&bad).is_none());
         }
-        for typ in 3..=255 {
-            let mut pkt = [0; HDR_LEN];
-            seal(&KEY, typ, 7, &mut pkt);
-            assert!(open(&KEY, &mut pkt).is_none());
+        for flags in 2..=255 {
+            let mut bad = valid;
+            bad[9] = flags;
+            assert!(Header::decode(&bad).is_none());
         }
     }
 }

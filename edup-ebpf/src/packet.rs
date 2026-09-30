@@ -1,6 +1,30 @@
 //! All packet pointers are short-lived: reload them after adjust_head/tail.
 use aya_ebpf::programs::XdpContext;
+use core::intrinsics::{AtomicOrdering, atomic_cxchg};
 use edup_common::{csum, maps::*};
+
+// BPF has cmpxchg (ISA v3), but Rust's target does not expose atomic CAS in core.
+#[inline(always)]
+pub unsafe fn compare_exchange(ptr: *mut u64, old: u64, new: u64) -> bool {
+    unsafe {
+        atomic_cxchg::<u64, { AtomicOrdering::Relaxed }, { AtomicOrdering::Relaxed }>(ptr, old, new)
+            .1
+    }
+}
+
+/// Atomic increment returning the previous value, or `None` under sustained
+/// contention. Built on compare-exchange: aya-build compiles for the generic
+/// BPF CPU, where LLVM cannot use the result of an atomic add.
+#[inline(always)]
+pub unsafe fn fetch_increment(ptr: *mut u64) -> Option<u64> {
+    for _ in 0..8 {
+        let old = unsafe { core::ptr::read_volatile(ptr) };
+        if unsafe { compare_exchange(ptr, old, old + 1) } {
+            return Some(old);
+        }
+    }
+    None
+}
 
 pub const ETH: usize = 14;
 
@@ -29,6 +53,24 @@ pub fn write<T: Copy>(ctx: &XdpContext, offset: usize, value: T) -> Result<(), u
     }
     unsafe { core::ptr::write_unaligned(ptr as *mut T, value) };
     Ok(())
+}
+
+/// Pointer to `N` checked bytes at `offset`, for accesses whose offsets the
+/// verifier knows only as ranges. `read`/`write` let LLVM recompute the
+/// offset or pointer separately for the check and the access, which the
+/// verifier then treats as unrelated values. Here both are opaque, so the
+/// checked values are exactly the ones used.
+#[inline(always)]
+pub fn bytes<const N: usize>(ctx: &XdpContext, offset: usize) -> Result<*mut u8, u32> {
+    let offset = core::hint::black_box(offset);
+    if offset > 2048 {
+        return Err(stat::DROP_BAD_HDR);
+    }
+    let ptr = core::hint::black_box(ctx.data() + offset);
+    if ptr + N > data_end(ctx) {
+        return Err(stat::DROP_BAD_HDR);
+    }
+    Ok(ptr as *mut u8)
 }
 
 #[derive(Clone, Copy)]

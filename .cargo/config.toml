@@ -1,3 +1,6 @@
 [target.bpfel-unknown-none]
 linker = "bpf-linker"
-rustflags = ["-C", "panic=abort", "-C", "target-cpu=v3"]
+# Match aya-build (edup-server/build.rs), which replaces these flags when it
+# builds the embedded object: the generic BPF CPU, debug info and BTF. BTF
+# makes the cryptographic passes kernel global functions.
+rustflags = ["-C", "panic=abort", "-C", "debuginfo=2", "-C", "link-arg=--btf"]

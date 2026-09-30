@@ -7,14 +7,19 @@ license.workspace = true
 [features]
 default = []
 # Userspace (клиент и сервер): вывод ключа из пароля, работа с буферами.
-std = ["dep:blake2"]
+std = ["dep:blake2", "dep:chacha20"]
 # Только серверный загрузчик на Linux: aya::Pod для структур карт.
 aya = ["std", "dep:aya"]
 
 [dependencies]
 aya = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
+chacha20 = { workspace = true, optional = true }
 
 [[example]]
 name = "xdp_check"
 required-features = ["aya"]
+
+[dev-dependencies]
+# Reference implementation for cross-checking the RFC 8439 construction.
+chacha20poly1305.workspace = true

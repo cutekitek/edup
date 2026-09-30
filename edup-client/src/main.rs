@@ -1,6 +1,7 @@
 mod config;
 mod packet;
 mod routes;
+mod session;
 mod tun_io;
 mod udp;
 #[cfg(target_os = "windows")]
@@ -10,10 +11,8 @@ mod windows_delivery;
 use anyhow::ensure;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use edup_common::{
-    key::derive_key,
-    wire::{self, Key},
-};
+use edup_common::wire;
+use session::{Link, Received, Receiver};
 use std::{
     io,
     net::UdpSocket,
@@ -49,6 +48,7 @@ struct Counters {
     dropped: AtomicU64,
     keepalive_sent: AtomicU64,
     keepalive_received: AtomicU64,
+    handshakes: AtomicU64,
     tun_segmented_reads: AtomicU64,
     tun_coalesced_writes: AtomicU64,
     #[cfg(target_os = "windows")]
@@ -57,12 +57,13 @@ struct Counters {
 impl Counters {
     fn report(&self) {
         eprintln!(
-            "tx={} rx={} dropped={} keepalive_tx={} keepalive_rx={} tun_segmented_reads={} tun_coalesced_writes={}",
+            "tx={} rx={} dropped={} keepalive_tx={} keepalive_rx={} handshakes={} tun_segmented_reads={} tun_coalesced_writes={}",
             self.sent.load(Relaxed),
             self.received.load(Relaxed),
             self.dropped.load(Relaxed),
             self.keepalive_sent.load(Relaxed),
             self.keepalive_received.load(Relaxed),
+            self.handshakes.load(Relaxed),
             self.tun_segmented_reads.load(Relaxed),
             self.tun_coalesced_writes.load(Relaxed)
         );
@@ -139,19 +140,19 @@ fn run(cfg: config::Settings) -> Result<()> {
         None
     };
     let counts = Counters::default();
-    let key = derive_key(&cfg.password);
+    let link = Link::new(cfg.user, &cfg.password);
     println!(
         "edup client ready: {} {}, server={}, MTU={}",
         cfg.interface, address, cfg.server, cfg.mtu
     );
     let result = std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
-            let result = send_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event);
+            let result = send_loop(&tun, &socket, &cfg, &link, &counts, &stop, &event);
             stop.store(true, Relaxed);
             let _ = event.trigger();
             result
         });
-        let result = receive_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event);
+        let result = receive_loop(&tun, &socket, &cfg, &link, &counts, &stop, &event);
         stop.store(true, Relaxed);
         let _ = event.trigger();
         let sent = worker
@@ -258,7 +259,7 @@ fn send_loop(
     tun: &SyncDevice,
     socket: &udp::Transport,
     cfg: &config::Settings,
-    key: &Key,
+    link: &Link,
     counts: &Counters,
     stop: &AtomicBool,
     event: &InterruptEvent,
@@ -284,6 +285,11 @@ fn send_loop(
             if num > 1 {
                 counts.tun_segmented_reads.fetch_add(1, Relaxed);
             }
+            // Until the first handshake completes there is nothing to seal with.
+            let Some(session) = link.current() else {
+                counts.dropped.fetch_add(num as u64, Relaxed);
+                continue;
+            };
             for i in 0..num {
                 let len = reader.sizes[i];
                 let data = &mut reader.packets[i][..wire::HDR_LEN + len];
@@ -294,7 +300,7 @@ fn send_loop(
                     continue;
                 };
                 packet::clamp_mss(payload, ihl, cfg.mtu);
-                let Some(len) = wire::seal_data(key, cfg.user, data, true) else {
+                let Some(len) = session.seal_data(cfg.user, data) else {
                     counts.dropped.fetch_add(1, Relaxed);
                     continue;
                 };
@@ -346,7 +352,7 @@ fn receive_loop(
     tun: &SyncDevice,
     socket: &udp::Transport,
     cfg: &config::Settings,
-    key: &Key,
+    link: &Link,
     counts: &Counters,
     stop: &AtomicBool,
     event: &InterruptEvent,
@@ -359,7 +365,8 @@ fn receive_loop(
     let mut writer = tun_io::Writer::new();
     let address = cfg.address()?.octets();
     let address6 = cfg.address6()?.map(|ip| ip.octets());
-    let mut next = Instant::now();
+    let mut receiver = Receiver::new(Instant::now());
+    let interval = Duration::from_secs(cfg.keepalive_secs);
     let diagnostics = std::env::var_os("EDUP_DIAGNOSTICS").is_some();
     let mut report_at = Instant::now() + Duration::from_secs(5);
     while !stop.load(Relaxed) {
@@ -368,17 +375,18 @@ fn receive_loop(
             report_offload(socket);
             report_at = Instant::now() + Duration::from_secs(5);
         }
-        if Instant::now() >= next {
-            let mut keepalive = [0; wire::HDR_LEN];
-            wire::seal(key, wire::TYPE_KEEPALIVE, cfg.user, &mut keepalive);
-            match socket.send(&keepalive) {
-                Ok(_) => {
-                    counts.keepalive_sent.fetch_add(1, Relaxed);
-                }
+        // A RESPONSE schedules an immediate KEEPALIVE that confirms the new
+        // session, hence the loop: at most an INIT then a KEEPALIVE.
+        while let Some(control) = receiver.poll(link, Instant::now(), interval) {
+            match socket.send(control.bytes()) {
+                Ok(_) => {}
                 Err(e) if temporary(&e) => {}
-                Err(e) => return Err(e).context("send KEEPALIVE"),
+                Err(e) => return Err(e).context("send control packet"),
             }
-            next = Instant::now() + Duration::from_secs(cfg.keepalive_secs);
+            match control {
+                session::Outgoing::Init(_) => counts.handshakes.fetch_add(1, Relaxed),
+                session::Outgoing::Keepalive(_) => counts.keepalive_sent.fetch_add(1, Relaxed),
+            };
         }
         let (len, stride) = match socket.recv(&mut buf) {
             Ok(v) => v,
@@ -399,9 +407,16 @@ fn receive_loop(
             if stop.load(Relaxed) {
                 break;
             }
-            if let Some(payload) =
-                decode_packet(data, &mut decoded, cfg, key, address, address6, counts)
-            {
+            if let Some(payload) = decode_packet(
+                data,
+                &mut decoded,
+                cfg,
+                link,
+                &mut receiver,
+                address,
+                address6,
+                counts,
+            ) {
                 #[cfg(target_os = "linux")]
                 {
                     writer.push(payload);
@@ -473,7 +488,8 @@ fn decode_packet<'a>(
     data: &mut [u8],
     decoded: &'a mut [u8],
     cfg: &config::Settings,
-    key: &Key,
+    link: &Link,
+    receiver: &mut Receiver,
     address: [u8; 4],
     address6: Option<[u8; 16]>,
     counts: &Counters,
@@ -483,23 +499,22 @@ fn decode_packet<'a>(
         counts.dropped.fetch_add(1, Relaxed);
         return None;
     }
-    if wire::user_id(data) != Some(cfg.user) {
-        counts.dropped.fetch_add(1, Relaxed);
-        return None;
-    }
-    let Some(opened) = wire::open(key, data) else {
-        counts.dropped.fetch_add(1, Relaxed);
-        return None;
+    let header = match receiver.open(link, data, Instant::now()) {
+        Received::Data(header) => header,
+        Received::Keepalive => {
+            counts.keepalive_received.fetch_add(1, Relaxed);
+            return None;
+        }
+        Received::Established(phase) => {
+            eprintln!("session established (key phase {phase})");
+            return None;
+        }
+        Received::Dropped => {
+            counts.dropped.fetch_add(1, Relaxed);
+            return None;
+        }
     };
-    if opened.user != cfg.user || opened.flags != 0 {
-        counts.dropped.fetch_add(1, Relaxed);
-        return None;
-    }
-    if opened.typ == wire::TYPE_KEEPALIVE && len == wire::HDR_LEN {
-        counts.keepalive_received.fetch_add(1, Relaxed);
-        return None;
-    }
-    if opened.typ
+    if header.typ
         != if address6.is_some() {
             wire::TYPE_IPV6
         } else {
@@ -510,7 +525,7 @@ fn decode_packet<'a>(
         return None;
     }
     let local: &[u8] = address6.as_ref().map_or(&address[..], |a| &a[..]);
-    let Some(size) = wire::unpack(opened.typ, &data[wire::HDR_LEN..], decoded, local, false) else {
+    let Some(size) = wire::unpack(header.typ, &data[wire::HDR_LEN..], decoded, local, false) else {
         counts.dropped.fetch_add(1, Relaxed);
         return None;
     };
@@ -546,13 +561,43 @@ fn temporary(e: &io::Error) -> bool {
 #[cfg(test)]
 mod receive_tests {
     use super::*;
+    use edup_common::{
+        aead::{self, Cipher},
+        key::derive_key,
+        wire::Header,
+    };
 
     #[test]
     fn coalesced_messages_are_validated_independently() {
         let cfg: config::Settings =
             toml::from_str(include_str!("../../config/client.example.toml")).unwrap();
-        let key = derive_key(&cfg.password);
+        let link = Link::new(cfg.user, &cfg.password);
+        let start = Instant::now();
+        let mut receiver = Receiver::new(start);
+        let Some(session::Outgoing::Init(init)) =
+            receiver.poll(&link, start, Duration::from_secs(15))
+        else {
+            panic!("expected INIT");
+        };
+        let k1 = aead::open_init(&derive_key(&cfg.password), &init).unwrap();
+        let (mut response, key) = aead::response(&k1, cfg.user, 1, &[3; 16]);
+        let counts = Counters::default();
+        let mut decoded = vec![0; cfg.mtu as usize];
         let address = cfg.address().unwrap().octets();
+        assert!(
+            decode_packet(
+                &mut response,
+                &mut decoded,
+                &cfg,
+                &link,
+                &mut receiver,
+                address,
+                None,
+                &counts
+            )
+            .is_none()
+        );
+        let cipher = Cipher::new(&key);
         let mut aggregate = Vec::new();
         for (case, user) in [(1, cfg.user), (2, -42), (3, cfg.user), (4, cfg.user)] {
             let mut data = vec![0; wire::HDR_LEN + 40];
@@ -563,22 +608,34 @@ mod receive_tests {
             ip[12..16].copy_from_slice(&[203, 0, 113, 9]);
             ip[16..20].copy_from_slice(&address);
             ip[24..26].copy_from_slice(&20u16.to_be_bytes());
-            let len = wire::seal_data(&key, user, &mut data, false).unwrap();
+            let len = aead::seal_data(&cipher, user, 1, case, &mut data, false).unwrap();
             data.truncate(len);
             if case == 3 {
                 data[5] ^= 1;
             } // corrupt public user ID in the third segment
             aggregate.extend(data);
         }
-        let mut keepalive = [0; wire::HDR_LEN];
-        wire::seal(&key, wire::TYPE_KEEPALIVE, cfg.user, &mut keepalive);
-        aggregate.extend(keepalive);
-        let counts = Counters::default();
+        let header = Header {
+            user: cfg.user,
+            typ: wire::TYPE_KEEPALIVE,
+            phase: 1,
+            counter: 5,
+        };
+        aggregate.extend(aead::keepalive(&cipher, header, wire::TO_CLIENT));
         let mut accepted = 0;
-        let mut decoded = vec![0; cfg.mtu as usize];
         for packet in aggregate.chunks_mut(wire::HDR_LEN + 40 - wire::IPV4_SAVING) {
             accepted += usize::from(
-                decode_packet(packet, &mut decoded, &cfg, &key, address, None, &counts).is_some(),
+                decode_packet(
+                    packet,
+                    &mut decoded,
+                    &cfg,
+                    &link,
+                    &mut receiver,
+                    address,
+                    None,
+                    &counts,
+                )
+                .is_some(),
             );
         }
         assert_eq!(accepted, 2);
@@ -590,7 +647,8 @@ mod receive_tests {
                 &mut aggregate,
                 &mut decoded,
                 &cfg,
-                &key,
+                &link,
+                &mut receiver,
                 address,
                 None,
                 &counts

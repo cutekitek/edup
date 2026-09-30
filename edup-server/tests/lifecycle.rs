@@ -9,9 +9,10 @@ use aya::{
 };
 use aya_obj::programs::XdpAttachType;
 use edup_common::{
+    aead::{self, Cipher},
     key::derive_key,
     maps::{Config, NatInKey, NatInVal, NatOutKey, NatOutVal, User},
-    wire,
+    wire::{self, Header},
 };
 use std::{
     fs,
@@ -75,40 +76,61 @@ fn checksum(bytes: &[u8]) -> u16 {
     }
     !(sum as u16)
 }
-fn keepalive(gen_path: &Path) {
-    let prog = Xdp::from_pin(gen_path.join("program"), XdpAttachType::Interface).unwrap();
-    let mut data = [0u8; 42 + wire::HDR_LEN];
-    data[..14].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 8, 0]);
-    data[14] = 0x45;
-    data[16..18].copy_from_slice(&((28 + wire::HDR_LEN) as u16).to_be_bytes());
-    data[22] = 64;
-    data[23] = 17;
-    data[26..30].copy_from_slice(&[198, 51, 100, 7]);
-    data[30..34].copy_from_slice(&[192, 0, 2, 1]);
-    let c = checksum(&data[14..34]);
-    data[24..26].copy_from_slice(&c.to_be_bytes());
-    data[34..36].copy_from_slice(&40000u16.to_be_bytes());
-    data[36..38].copy_from_slice(&7777u16.to_be_bytes());
-    data[38..40].copy_from_slice(&((8 + wire::HDR_LEN) as u16).to_be_bytes());
-    wire::seal(
-        &derive_key("replace-this-password"),
-        wire::TYPE_KEEPALIVE,
-        4829017365182049271,
-        &mut data[42..],
-    );
-    let mut output = [0; 128];
+const ID: i64 = 4829017365182049271;
+
+/// Ethernet frame of a UDP datagram from the test client to the server.
+fn frame(cfg: &Config, v6: bool, payload: &[u8]) -> Vec<u8> {
+    let mut udp = vec![0; 8];
+    udp[..2].copy_from_slice(&40000u16.to_be_bytes());
+    udp[2..4].copy_from_slice(&cfg.port_be.to_ne_bytes());
+    udp[4..6].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    udp.extend(payload);
+    let mut data = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    if v6 {
+        data.extend([0x86, 0xdd, 0x60, 0, 0, 0]);
+        data.extend((udp.len() as u16).to_be_bytes());
+        data.extend([17, 64]);
+        data.extend(
+            "2001:db8:1::7"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        data.extend(cfg.server_ip6);
+        let mut pseudo = data[22..54].to_vec();
+        pseudo.extend((udp.len() as u32).to_be_bytes());
+        pseudo.extend([0, 0, 0, 17]);
+        pseudo.extend(&udp);
+        let sum = checksum(&pseudo);
+        udp[6..8].copy_from_slice(&if sum == 0 { 0xffff } else { sum }.to_be_bytes());
+    } else {
+        data.extend([8, 0, 0x45, 0]);
+        data.extend(((20 + udp.len()) as u16).to_be_bytes());
+        data.extend([0, 0, 0, 0, 64, 17, 0, 0, 198, 51, 100, 7]);
+        data.extend(cfg.server_ip_be.to_ne_bytes());
+        let c = checksum(&data[14..34]);
+        data[24..26].copy_from_slice(&c.to_be_bytes());
+    }
+    data.extend(udp);
+    data
+}
+
+fn run(prog: &Xdp, input: &[u8]) -> (u32, Vec<u8>) {
+    let mut output = vec![0; 256];
     let result = prog
         .test_run(TestRunOptions {
-            data_in: Some(&data),
+            data_in: Some(input),
             data_out: Some(&mut output),
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(result.return_value, 3);
-    assert_eq!(result.data_size_out, 60);
+    output.truncate(result.data_size_out as usize);
+    (result.return_value, output)
 }
 
-fn keepalive6(gen_path: &Path) {
+/// Handshake, then a KEEPALIVE that confirms the session, through the
+/// pinned dispatcher and its tail-called programs.
+fn keepalive(gen_path: &Path, v6: bool) {
     let cfg = Array::<_, Config>::try_from(Map::Array(
         MapData::from_pin(gen_path.join("CONFIG")).unwrap(),
     ))
@@ -119,7 +141,7 @@ fn keepalive6(gen_path: &Path) {
         MapData::from_pin(gen_path.join("USER_IDS")).unwrap(),
     ))
     .unwrap()
-    .get(&4829017365182049271, 0)
+    .get(&ID, 0)
     .unwrap();
     let user = Array::<_, User>::try_from(Map::Array(
         MapData::from_pin(gen_path.join("USERS")).unwrap(),
@@ -128,48 +150,34 @@ fn keepalive6(gen_path: &Path) {
     .get(&(slot as u32), 0)
     .unwrap();
     let prog = Xdp::from_pin(gen_path.join("program"), XdpAttachType::Interface).unwrap();
-    let mut data = [0u8; 62 + wire::HDR_LEN];
-    data[..14].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x86, 0xdd]);
-    let ip = &mut data[14..];
-    ip[0] = 0x60;
-    ip[4..6].copy_from_slice(&((8 + wire::HDR_LEN) as u16).to_be_bytes());
-    ip[6] = 17;
-    ip[7] = 64;
-    ip[8..24].copy_from_slice(
-        &"2001:db8:1::7"
-            .parse::<std::net::Ipv6Addr>()
-            .unwrap()
-            .octets(),
-    );
-    ip[24..40].copy_from_slice(&cfg.server_ip6);
-    ip[40..42].copy_from_slice(&40000u16.to_be_bytes());
-    ip[42..44].copy_from_slice(&cfg.port_be.to_ne_bytes());
-    ip[44..46].copy_from_slice(&((8 + wire::HDR_LEN) as u16).to_be_bytes());
-    wire::seal(
-        &wire::Key {
-            k0: user.key0,
-            k1: user.key1,
-        },
-        wire::TYPE_KEEPALIVE,
-        4829017365182049271,
-        &mut ip[48..],
-    );
-    let mut pseudo = ip[8..40].to_vec();
-    pseudo.extend([0, 0, 0, (8 + wire::HDR_LEN) as u8, 0, 0, 0, 17]);
-    pseudo.extend(&ip[40..]);
-    let sum = checksum(&pseudo);
-    ip[46..48].copy_from_slice(&if sum == 0 { 0xffff } else { sum }.to_be_bytes());
-    let mut output = [0; 128];
-    let result = prog
-        .test_run(TestRunOptions {
-            data_in: Some(&data),
-            data_out: Some(&mut output),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(result.return_value, 3);
-    assert_eq!(result.data_size_out as usize, data.len());
-    assert_eq!(&output[22..38], &cfg.server_ip6);
+    let body = 14 + if v6 { 40 } else { 20 } + 8;
+    let (init, k1) = aead::init(&user.key, ID, &[v6 as u8; 16]);
+    let (action, output) = run(&prog, &frame(&cfg, v6, &init));
+    assert_eq!(action, 3, "RESPONSE");
+    let (key, phase) = aead::open_response(&k1, &output[body..]).expect("RESPONSE");
+    let mut packet = Header {
+        user: ID,
+        typ: wire::TYPE_KEEPALIVE,
+        phase,
+        counter: 1,
+    }
+    .encode()
+    .to_vec();
+    packet.extend([0; wire::TAG_LEN]);
+    Cipher::new(&key).seal(wire::TO_SERVER, &mut packet);
+    let input = frame(&cfg, v6, &packet);
+    let (action, mut output) = run(&prog, &input);
+    assert_eq!(action, 3, "KEEPALIVE reply");
+    assert_eq!(output.len(), input.len());
+    if v6 {
+        assert_eq!(&output[22..38], &cfg.server_ip6);
+    }
+    let header = Cipher::new(&key)
+        .open(wire::TO_CLIENT, &mut output[body..])
+        .expect("reply authenticates");
+    assert_eq!(header.typ, wire::TYPE_KEEPALIVE);
+    // The same packet again is a replay.
+    assert_eq!(run(&prog, &input).0, 1);
 }
 
 // The outer process creates disposable mount and network namespaces. Even a
@@ -243,9 +251,9 @@ fn isolated_lifecycle() {
     assert_eq!(ids.get(&4829017365182049271, 0).unwrap(), 1);
     assert_eq!(ids.get(&-738215604982170351, 0).unwrap(), 2);
     drop(ids);
-    keepalive(&first);
+    keepalive(&first, false);
     assert!(server(&temp.join("missing"), "users", true).contains("198.51.100.7:40000"));
-    keepalive6(&first);
+    keepalive(&first, true);
     assert!(server(&temp.join("missing"), "users", true).contains("[2001:db8:1::7]:40000"));
     assert!(server(&temp.join("missing"), "stats", true).contains("keepalive 2"));
     // Repeated up and a second instance may not replace an existing attachment.
@@ -363,11 +371,11 @@ fn isolated_lifecycle() {
             .unwrap();
     assert_eq!(users_map.get(&42, 0).unwrap().enabled, 0);
     assert_eq!(
-        users_map.get(&2, 0).unwrap().key0,
-        derive_key("new-password").k0
+        users_map.get(&2, 0).unwrap().key,
+        derive_key("new-password")
     );
     drop(users_map);
-    keepalive6(&active);
+    keepalive(&active, true);
     assert!(server(&config, "stats", true).contains("keepalive 1"));
 
     server(&temp.join("missing"), "down", true);
@@ -382,8 +390,8 @@ fn isolated_lifecycle() {
     )
     .unwrap();
     server(&config, "up", true);
-    keepalive(&generation());
-    keepalive6(&generation());
+    keepalive(&generation(), false);
+    keepalive(&generation(), true);
     server(&config, "down", true);
     println!(
         "PASS: native/generic attach, pin lifetime, packet/maps, reload/reset, failure preservation, exclusive attach, down/idempotence"

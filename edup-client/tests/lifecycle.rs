@@ -1,6 +1,10 @@
 #![cfg(target_os = "linux")]
 
-use edup_common::{key::derive_key, wire};
+use edup_common::{
+    aead::{self, Cipher},
+    key::derive_key,
+    wire::{self, Header},
+};
 use std::{
     fs,
     net::UdpSocket,
@@ -74,7 +78,8 @@ fn started(dir: &Path, client: &mut Process) {
             client.0.try_wait().unwrap().is_none(),
             "client exited: {log}"
         );
-        log.contains("client ready")
+        // Data flows once the handshake has completed.
+        log.contains("client ready") && log.contains("session established")
     });
 }
 fn assert_clean() {
@@ -134,7 +139,7 @@ fn isolated(ipv6: bool) {
         let config = fs::read_to_string(&path)
             .unwrap()
             .replace("\"192.0.2.1:7777\"", "\"[2001:db8:1::1]:7777\"")
-            .replace("mtu = 1473", "mtu = 1461");
+            .replace("mtu = 1450", "mtu = 1438");
         fs::write(path, format!("{config}\ntunnel_ip6 = \"fd66::7\"\n")).unwrap();
     }
     ip(&["link", "set", "lo", "up"]);
@@ -198,7 +203,7 @@ fn isolated(ipv6: bool) {
     })
     .unwrap();
     udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let payload = vec![0x5au8; if ipv6 { 1392 } else { 1400 }];
+    let payload = vec![0x5au8; if ipv6 { 1390 } else { 1400 }];
     udp.send(&payload).unwrap();
     let mut reply = [0u8; 1500];
     let len = udp.recv(&mut reply).unwrap();
@@ -289,7 +294,7 @@ fn isolated(ipv6: bool) {
         let udp6 = UdpSocket::bind("[fd66::7]:0").unwrap();
         udp6.connect("[2001:db8:2::9]:9000").unwrap();
         udp6.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let payload = [0x59; 1413]; // 1461-byte IPv6 packet, 1500-byte outer packet
+        let payload = [0x59; 1390]; // 1438-byte IPv6 packet, 1500-byte outer packet
         udp6.send(&payload).unwrap();
         let mut data = [0; 1500];
         let n = udp6.recv(&mut data).unwrap();
@@ -417,7 +422,10 @@ fn echo_peer() {
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
     fs::write(dir.join("peer-ready"), "").unwrap();
-    let key = derive_key("replace-this-password");
+    const ID: i64 = 4829017365182049271;
+    let user_key = derive_key("replace-this-password");
+    // The session this fake server negotiated: cipher, key phase, next counter.
+    let mut session: Option<(Cipher, u8, u64)> = None;
     let mut buf = [0u8; 2048];
     let mut keepalives = 0;
     let mut injected = false;
@@ -435,8 +443,23 @@ fn echo_peer() {
             }
             Err(e) => panic!("{e}"),
         };
-        let opened = wire::open(&key, &mut buf[..len]).unwrap();
-        assert_eq!(opened.user, 4829017365182049271);
+        let header = Header::decode(&buf[..len]).unwrap();
+        assert_eq!(header.user, ID);
+        if header.typ == wire::TYPE_INIT {
+            let k1 = aead::open_init(&user_key, &buf[..len]).unwrap();
+            let mut nonce = [0; wire::NONCE_LEN];
+            getrandom::fill(&mut nonce).unwrap();
+            let (response, key) = aead::response(&k1, ID, 1, &nonce);
+            session = Some((Cipher::new(&key), 1, 1));
+            socket.send_to(&response, from).unwrap();
+            continue;
+        }
+        let (cipher, phase, tx) = session.as_mut().expect("INIT first");
+        let opened = cipher.open(wire::TO_SERVER, &mut buf[..len]).unwrap();
+        let mut next = || {
+            *tx += 1;
+            *tx
+        };
         let mut packet = [0u8; 2048];
         let ip_len = if opened.typ == wire::TYPE_KEEPALIVE {
             0
@@ -457,8 +480,16 @@ fn echo_peer() {
             fs::write(dir.join("keepalives"), keepalives.to_string()).unwrap();
             if !injected {
                 socket.send_to(&[0; 3], from).unwrap();
-                let mut wrong = [0; wire::HDR_LEN];
-                wire::seal(&key, wire::TYPE_KEEPALIVE, 42, &mut wrong);
+                let wrong = aead::keepalive(
+                    cipher,
+                    Header {
+                        user: 42,
+                        typ: wire::TYPE_KEEPALIVE,
+                        phase: *phase,
+                        counter: next(),
+                    },
+                    wire::TO_CLIENT,
+                );
                 socket.send_to(&wrong, from).unwrap();
                 injected = true;
             }
@@ -529,13 +560,23 @@ fn echo_peer() {
             }
         }
         let len = if opened.typ == wire::TYPE_KEEPALIVE {
-            wire::seal(&key, opened.typ, 4829017365182049271, &mut buf[..len]);
-            len
+            let reply = aead::keepalive(
+                cipher,
+                Header {
+                    counter: next(),
+                    ..opened
+                },
+                wire::TO_CLIENT,
+            );
+            buf[..reply.len()].copy_from_slice(&reply);
+            reply.len()
         } else {
             buf[wire::HDR_LEN..wire::HDR_LEN + ip_len].copy_from_slice(&packet[..ip_len]);
-            wire::seal_data(
-                &key,
-                4829017365182049271,
+            aead::seal_data(
+                cipher,
+                ID,
+                *phase,
+                next(),
                 &mut buf[..wire::HDR_LEN + ip_len],
                 false,
             )

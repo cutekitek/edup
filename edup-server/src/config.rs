@@ -132,13 +132,13 @@ impl Settings {
             !(self.nat_port_min..=self.nat_port_max).contains(&self.port),
             "NAT range overlaps the tunnel port"
         );
-        let max = wire::MAX_KS_WORDS as usize * 8
+        // The ciphertext (compact inner packet) is bounded by the XDP loops.
+        let max = wire::MAX_BODY
             + if self.server_ip6.is_some() {
                 wire::OVERHEAD_V6 + wire::IPV6_SAVING
             } else {
                 wire::OVERHEAD_V4 + wire::IPV4_SAVING
-            }
-            - wire::CONTROL_LEN;
+            };
         ensure!(
             (576 + wire::OVERHEAD_V4..=max).contains(&(self.max_frame as usize)),
             "max_frame must be between {} and {max}",
@@ -189,6 +189,8 @@ impl Settings {
             gateway_mac: parse_mac(self.gateway_mac.as_deref())?,
             gateway6_mac: parse_mac(self.gateway6_mac.as_deref())?,
             _pad: [0; 4],
+            // The loader sets a fresh random salt for every load.
+            salt: 0,
         })
     }
 }
@@ -276,7 +278,11 @@ mod tests {
         let mut cfg = config();
         cfg.nat_port_min = cfg.nat_port_max + 1;
         assert!(cfg.validate().is_err());
-        for mtu in [0, 602, 1573] {
+        for mtu in [
+            0,
+            576 + wire::OVERHEAD_V4 as u16 - 1,
+            (wire::MAX_BODY + wire::OVERHEAD_V4 + wire::IPV4_SAVING) as u16 + 1,
+        ] {
             let mut cfg = config();
             cfg.max_frame = mtu;
             assert!(cfg.validate().is_err());
@@ -302,9 +308,9 @@ mod tests {
             assert_eq!(raw.nat_ip6, c.nat_ip6.unwrap().octets());
             assert_eq!(raw.gateway6_mac, [2, 1, 2, 3, 4, 5]);
         }
-        c.max_frame = 1318;
+        c.max_frame = (1280 + wire::OVERHEAD_V6 - 1) as u16;
         assert!(c.validate().is_err());
-        c.max_frame = 1319;
+        c.max_frame = (1280 + wire::OVERHEAD_V6) as u16;
         c.validate().unwrap();
         for mac in [
             "",
