@@ -30,18 +30,21 @@ jobs:
             package: edup-client
             config: client
             extension: .exe
+            archive: zip
           - os: ubuntu-22.04
             platform: linux
             target: x86_64-unknown-linux-gnu
             package: edup-client
             config: client
             extension: ''
+            archive: tar.gz
           - os: ubuntu-22.04
             platform: linux
             target: x86_64-unknown-linux-gnu
             package: edup-server
             config: server
             extension: ''
+            archive: tar.gz
     defaults:
       run:
         shell: bash
@@ -51,6 +54,7 @@ jobs:
       CONFIG: ${{ matrix.config }}
       EXTENSION: ${{ matrix.extension }}
       ARCHIVE_NAME: ${{ matrix.package }}-${{ matrix.platform }}-x64
+      ARCHIVE_FILE: dist/${{ matrix.package }}-${{ matrix.platform }}-x64.${{ matrix.archive }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,19 +94,26 @@ jobs:
       - name: Archive Linux package
         if: runner.os == 'Linux'
         # Preserve executable permissions when downloaded from Actions.
-        run: tar -czf "dist/$ARCHIVE_NAME.tar.gz" -C dist "$ARCHIVE_NAME"
+        run: tar -czf "$ARCHIVE_FILE" -C dist "$ARCHIVE_NAME"
 
       - name: Archive Windows package
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path "dist/$env:ARCHIVE_NAME" -DestinationPath "dist/$env:ARCHIVE_NAME.zip"
+        run: Compress-Archive -Path "dist/$env:ARCHIVE_NAME" -DestinationPath "$env:ARCHIVE_FILE"
 
       - name: Upload executable package
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ env.ARCHIVE_NAME }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
+          # Upload the archive as-is instead of wrapping it in another zip.
+          # The artifact is named after the file; `name` is ignored.
+          path: ${{ env.ARCHIVE_FILE }}
+          archive: false
           if-no-files-found: error
-          compression-level: 0
+
+      - name: Link artifact in job summary
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          echo "### Download" >> "$GITHUB_STEP_SUMMARY"
+          echo "[$(basename "$ARCHIVE_FILE")]($ARTIFACT_URL)" >> "$GITHUB_STEP_SUMMARY"
