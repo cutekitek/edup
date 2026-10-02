@@ -414,6 +414,8 @@ name = "edup-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aya",
+ "aya-build",
  "blake2",
  "clap",
  "ctrlc",
@@ -441,6 +443,14 @@ dependencies = [
 
 [[package]]
 name = "edup-ebpf"
+version = "0.1.0"
+dependencies = [
+ "aya-ebpf",
+ "edup-common",
+]
+
+[[package]]
+name = "edup-ebpf-client"
 version = "0.1.0"
 dependencies = [
  "aya-ebpf",

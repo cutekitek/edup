@@ -46,12 +46,16 @@ impl Rules {
         if by_address(first) {
             return None;
         }
-        let fixed = self
-            .rules
+        (first.action != self.address_action(ip)).then_some(first.action)
+    }
+    /// The route the address rules alone give `ip`: the first rule containing
+    /// it, otherwise the default.
+    pub fn address_action(&self, ip: IpAddr) -> Action {
+        let address = key(ip);
+        self.rules
             .iter()
-            .find(|r| by_address(r))
-            .map_or(self.default, |r| r.action);
-        (first.action != fixed).then_some(first.action)
+            .find(|r| r.ip.contains(address))
+            .map_or(self.default, |r| r.action)
     }
 }
 
@@ -297,5 +301,21 @@ mod tests {
             Some(Action::Proxy)
         );
         assert_eq!(rules.plan(), Plan::default());
+    }
+
+    #[test]
+    fn address_action_follows_the_first_matching_rule() {
+        let rules = Rules {
+            rules: rules(&[
+                (set(&["10.1.0.0/16"]), Action::Bypass),
+                (set(&["10.0.0.0/8"]), Action::Proxy),
+            ]),
+            default: Action::Bypass,
+            server: server(),
+        };
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(rules.address_action(ip("10.1.2.3")), Action::Bypass);
+        assert_eq!(rules.address_action(ip("10.2.0.1")), Action::Proxy);
+        assert_eq!(rules.address_action(ip("11.0.0.1")), Action::Bypass);
     }
 }

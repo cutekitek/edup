@@ -21,6 +21,10 @@ pub struct Reader {
 }
 impl Reader {
     pub fn new() -> Self {
+        Self::with_segment_size(2048)
+    }
+    /// `segment` bounds every packet after the first in a batch.
+    pub fn with_segment_size(segment: usize) -> Self {
         Self {
             // Large enough even for an invalid oversized, non-GSO TUN packet.
             // Validation later drops it without truncating it into a valid packet.
@@ -31,7 +35,7 @@ impl Reader {
                         if i == 0 {
                             udp::RECEIVE_CAPACITY + wire::HDR_LEN
                         } else {
-                            2048
+                            segment
                         }
                     ]
                 })

@@ -18,8 +18,16 @@ flate2 = "1"
 ureq = "3"
 socket2 = "0.6"
 
+[features]
+# Linux "mode": "xdp". Building it requires the eBPF toolchain (see README).
+xdp = ["dep:aya", "dep:aya-build"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+aya = { workspace = true, optional = true }
+
+[build-dependencies]
+aya-build = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [

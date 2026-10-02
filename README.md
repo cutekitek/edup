@@ -32,6 +32,9 @@ when the network path is untrusted.
 - **Linux and Windows clients:** Linux TUN and Windows Wintun support.
 - **XDP forwarding:** handled packets bypass the server's host IP stack;
   unrelated traffic, including SSH and ARP, passes through normally.
+- **Linux XDP client mode:** optionally, eBPF on the client's network interface
+  carries the tunnel and routes each destination from a cache that userspace
+  fills on demand, without system routes; see [XDP mode](#xdp-mode-linux).
 - **Multiple users:** random signed 64-bit user IDs, individual passwords, automatic
   endpoint learning, and periodic KEEPALIVE. Clients choose their local TUN
   addresses independently; different users may use identical addresses.
@@ -66,6 +69,13 @@ Output: `target/release/edup-client` on Linux or
 Linux runtime requires root, `/dev/net/tun`, and `iproute2`. Windows requires
 Administrator privileges and an architecture-matching `wintun.dll` beside the
 executable, or an absolute DLL path in the configuration.
+
+The Linux [XDP mode](#xdp-mode-linux) needs the `xdp` feature, built with the
+server's eBPF toolchain (see below):
+
+```sh
+cargo build --locked --release -p edup-client --features xdp
+```
 
 ### Server — Linux or WSL
 
@@ -120,6 +130,7 @@ Example: `config/client.example.json`.
 
 ```jsonc
 {
+  // "mode": "xdp",                 // Linux eBPF datapath; default "tun"
   "server": "192.0.2.1:7777",       // Or "[2001:db8::1]:7777" for IPv6 UDP
   "user": 4829017365182049271,      // Public routing ID
   "password": "replace-this-password",
@@ -237,6 +248,71 @@ specific system routes, such as the local network, keep precedence.
 `"default_route": "bypass"` with no `routes` changes no routes at all: route
 traffic into the TUN manually. `edup-client check` prints the resulting route
 counts.
+
+### XDP mode (Linux)
+
+`"mode": "xdp"` (default `"tun"`) needs a client built with `--features xdp`.
+Instead of routes into the TUN device, eBPF programs on the network interface
+of the route to the server carry the tunnel and route each destination:
+
+- A TC egress program looks up every outgoing packet's destination in a route
+  cache (up to 131072 addresses, least recently used first out). Packets to
+  bypassed destinations continue unchanged; packets to proxied destinations are
+  encapsulated in the kernel and sent to the server.
+- An unknown destination is a route lookup: the program marks it pending and
+  hands the packet to the client through the TUN device. The client decides the
+  route with the same rules as TUN mode, stores it in the cache and sends the
+  packet again, which now follows the stored route. Later packets to that
+  destination stay in the kernel.
+- An XDP program on the same interface decapsulates the server's packets and
+  passes them to the local stack as ordinary packets for the interface address.
+- Packets follow the standard route, the one the system uses without edup,
+  whenever the client fails to respond: while its heartbeat is older than 2
+  seconds (the client is stopped, hung or killed), and when a lookup stays
+  unanswered for 0.5 seconds, until the destination is looked up again 5
+  seconds after the request. Packets never wait for the client.
+
+Routing rules apply as in TUN mode: the first matching rule decides, otherwise
+`default_route`. The server and multicast or broadcast addresses always take the
+standard route, as do destinations of the interface's other system routes, such
+as the local network. Domain rules update the cache from DNS answers, including
+destinations already cached. `"default_route": "bypass"` without `routes` is
+rejected in this mode.
+
+```jsonc
+{
+  "mode": "xdp",
+  "xdp_mode": "auto",   // native XDP if the driver supports it; "driver" or "skb"
+  "server": "192.0.2.1:7777",
+  // ...the TUN mode settings; interface names have at most 14 characters
+}
+```
+
+Requirements and limitations:
+- Linux 5.10 or newer, root, and an Ethernet or Wi-Fi interface. Linux 6.6
+  and newer attach the TC programs as links (TCX) that disappear with the
+  client. Older kernels use a `clsact` qdisc; programs left there by a crash
+  only pass traffic to the standard route and are replaced at the next start.
+- The TUN device `interface` still exists, without routes: it carries lookups
+  and the DNS forwarder's address. A veth pair `<interface>s`/`<interface>e`
+  carries proxied packets, so that the kernel completes TSO/GSO segmentation
+  and checksums before encapsulation. A pair left by a crash is removed at the
+  next start. Native XDP may briefly reset some drivers' interfaces.
+- Only traffic through that interface from the address of its route to the
+  server is routed; the client prints both at start. Replies carry no local
+  address, so traffic from other addresses, such as IPv6 temporary addresses,
+  keeps the standard route. Restart the client after the interface's
+  addresses or networks change.
+- `mtu` must fit the interface MTU minus the tunnel overhead. TCP MSS is
+  clamped in both directions; larger UDP and other packets to proxied
+  destinations are dropped, not fragmented.
+- As in TUN mode, existing connections to proxied destinations move into the
+  tunnel when the client starts.
+- Generic XDP (`"skb"`) runs after GRO: keep `rx-gro-list` disabled on the
+  interface (the default), or tunnel packets may arrive coalesced.
+
+At shutdown, and every 5 seconds with `EDUP_DIAGNOSTICS` set, the client prints
+lookup and `xdp_*` packet counters.
 
 ### IPv6
 

@@ -1,7 +1,7 @@
 //! DNS forwarder for domain rules. Addresses in answers for matched names get
 //! host routes before the answer reaches the application, so its first
 //! connection already takes the rule's route.
-use crate::{routes::Routes, routing::Rules};
+use crate::{config::Action, routes::Routes, routing::Rules};
 use anyhow::{Context, Result, bail};
 use std::{
     io::{self, Read, Write},
@@ -47,15 +47,28 @@ impl Listener {
     }
 }
 
+/// Where answers send their addresses: system host routes in TUN mode, the
+/// eBPF route cache in XDP mode.
+pub trait HostRoutes: Sync {
+    fn host(&self, ip: IpAddr, action: Action) -> Result<()>;
+}
+impl HostRoutes for Mutex<Routes> {
+    fn host(&self, ip: IpAddr, action: Action) -> Result<()> {
+        self.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .host(ip, action)
+    }
+}
+
 pub struct Forwarder<'a> {
     rules: &'a Rules,
-    routes: &'a Mutex<Routes>,
+    routes: &'a dyn HostRoutes,
     upstreams: Vec<SocketAddr>,
     pub queries: AtomicU64,
     pub failures: AtomicU64,
 }
 impl<'a> Forwarder<'a> {
-    pub fn new(rules: &'a Rules, routes: &'a Mutex<Routes>, upstreams: Vec<SocketAddr>) -> Self {
+    pub fn new(rules: &'a Rules, routes: &'a dyn HostRoutes, upstreams: Vec<SocketAddr>) -> Self {
         Self {
             rules,
             routes,
@@ -144,11 +157,10 @@ impl<'a> Forwarder<'a> {
             return Some(servfail(query, &question));
         };
         for ip in addresses(&response).unwrap_or_default() {
-            if let Some(action) = self.rules.host_action(&question.name, ip) {
-                let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(error) = routes.host(ip, action) {
-                    eprintln!("DNS route for {} ({ip}): {error:#}", question.name);
-                }
+            if let Some(action) = self.rules.host_action(&question.name, ip)
+                && let Err(error) = self.routes.host(ip, action)
+            {
+                eprintln!("DNS route for {} ({ip}): {error:#}", question.name);
             }
         }
         Some(response)

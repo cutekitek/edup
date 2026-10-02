@@ -11,6 +11,9 @@
   "offload": true,
   // Windows: by default wintun.dll is loaded beside edup-client.exe.
   // "wintun_dll": "C:\Program Files\edup\wintun.dll",
+  // Linux, built with --features xdp: eBPF carries the tunnel and routes each
+  // destination without system routes. "xdp_mode": "auto", "driver" or "skb".
+  // "mode": "xdp",
 
   // IPv6 mode: change server to "[2001:db8::1]:7777", mtu to 1461,
   // optional local IPv6 address (default is fd66::1):

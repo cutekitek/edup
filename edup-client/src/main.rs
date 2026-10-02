@@ -10,6 +10,8 @@ mod tun_io;
 mod udp;
 #[cfg(target_os = "windows")]
 mod windows_delivery;
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+mod xdp;
 
 #[cfg(target_os = "windows")]
 use anyhow::ensure;
@@ -95,14 +97,22 @@ fn main() -> Result<()> {
                 "manual".to_string()
             } else {
                 let rules = routing::resolve(&cfg)?;
-                let plan = rules.plan();
-                let mut text = format!(
-                    "default {}, {} rules: {} tunnel and {} bypass routes",
-                    cfg.routing.default_route.name(),
-                    cfg.routing.routes.len(),
-                    plan.tunnel.len(),
-                    plan.bypass.len() + usize::from(plan.server_exception),
-                );
+                let mut text = if cfg.mode == config::Mode::Xdp {
+                    format!(
+                        "default {}, {} rules decided per destination by the XDP route cache",
+                        cfg.routing.default_route.name(),
+                        cfg.routing.routes.len(),
+                    )
+                } else {
+                    let plan = rules.plan();
+                    format!(
+                        "default {}, {} rules: {} tunnel and {} bypass routes",
+                        cfg.routing.default_route.name(),
+                        cfg.routing.routes.len(),
+                        plan.tunnel.len(),
+                        plan.bypass.len() + usize::from(plan.server_exception),
+                    )
+                };
                 if rules.uses_dns() {
                     let servers: Vec<_> = cfg.dns_servers().iter().map(|s| s.to_string()).collect();
                     text += &format!(
@@ -114,18 +124,26 @@ fn main() -> Result<()> {
                 text
             };
             println!(
-                "Configuration valid: {} -> {}, MTU={}, routing: {routing}",
+                "Configuration valid: {} -> {}, MTU={}, routing: {routing}{}",
                 tunnel_address(&cfg)?,
                 cfg.server,
                 cfg.mtu,
+                if cfg.mode == config::Mode::Xdp {
+                    ", mode xdp"
+                } else {
+                    ""
+                },
             );
             Ok(())
         }
+        #[cfg(all(target_os = "linux", feature = "xdp"))]
+        Command::Run if cfg.mode == config::Mode::Xdp => xdp::run(cfg),
         Command::Run => run(cfg),
         Command::Credentials => unreachable!(),
     }
 }
-fn run(cfg: config::Settings) -> Result<()> {
+/// Ctrl+C and SIGTERM set the flag and wake blocked TUN reads.
+fn shutdown_signal() -> Result<(Arc<AtomicBool>, Arc<InterruptEvent>)> {
     let stop = Arc::new(AtomicBool::new(false));
     let event = Arc::new(InterruptEvent::new()?);
     let signal_stop = stop.clone();
@@ -135,6 +153,10 @@ fn run(cfg: config::Settings) -> Result<()> {
         let _ = signal_event.trigger();
     })
     .context("install shutdown handler")?;
+    Ok((stop, event))
+}
+fn run(cfg: config::Settings) -> Result<()> {
+    let (stop, event) = shutdown_signal()?;
     routes::ensure_available(&cfg.interface)?;
     // Rule-sets download before any route can capture the traffic.
     let rules = routing::resolve(&cfg)?;

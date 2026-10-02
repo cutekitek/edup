@@ -73,6 +73,10 @@ impl PhysicalRoute {
     pub fn source(&self) -> IpAddr {
         self.prefsrc
     }
+    #[cfg_attr(not(feature = "xdp"), allow(dead_code))]
+    pub fn device(&self) -> (&str, u32) {
+        (&self.dev, self.index)
+    }
     pub fn route(&self, prefix: Prefix) -> Route {
         Route {
             prefix,
@@ -121,6 +125,38 @@ impl Gateway {
             gateway: self.gateway,
         }
     }
+    #[cfg_attr(not(feature = "xdp"), allow(dead_code))]
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+/// Main-table routes through `dev` other than default routes: the local
+/// network and other specific system routes.
+#[cfg_attr(not(feature = "xdp"), allow(dead_code))]
+pub fn device_prefixes(dev: &str, ipv6: bool) -> Result<Vec<Prefix>> {
+    #[derive(Deserialize)]
+    struct Entry {
+        dst: String,
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    let json = ip(&args(&[
+        "-j",
+        if ipv6 { "-6" } else { "-4" },
+        "route",
+        "show",
+        "table",
+        "main",
+        "dev",
+        dev,
+    ]))?;
+    let routes: Vec<Entry> = serde_json::from_str(&json).context("read interface routes")?;
+    Ok(routes
+        .into_iter()
+        .filter(|r| r.kind.as_deref().is_none_or(|k| k == "unicast"))
+        .filter_map(|r| r.dst.parse::<Prefix>().ok())
+        .filter(|p| p.len != 0)
+        .collect())
 }
 fn if_index(name: &str) -> Result<u32> {
     let c = std::ffi::CString::new(name)?;

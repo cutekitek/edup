@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["edup-common", "edup-ebpf", "edup-server", "edup-client"]
+members = ["edup-common", "edup-ebpf", "edup-ebpf-client", "edup-server", "edup-client"]
 default-members = ["edup-common", "edup-server", "edup-client"]
 
 [workspace.package]
@@ -28,5 +28,9 @@ lto = true
 codegen-units = 1
 
 [profile.release.package.edup-ebpf]
+debug = 2
+codegen-units = 1
+
+[profile.release.package.edup-ebpf-client]
 debug = 2
 codegen-units = 1

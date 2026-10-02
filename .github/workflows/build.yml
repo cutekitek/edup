@@ -31,6 +31,7 @@ jobs:
             config: client
             extension: .exe
             archive: zip
+            features: ''
           - os: ubuntu-22.04
             platform: linux
             target: x86_64-unknown-linux-gnu
@@ -38,6 +39,8 @@ jobs:
             config: client
             extension: ''
             archive: tar.gz
+            # XDP mode embeds an eBPF object built with the eBPF toolchain.
+            features: xdp
           - os: ubuntu-22.04
             platform: linux
             target: x86_64-unknown-linux-gnu
@@ -45,6 +48,7 @@ jobs:
             config: server
             extension: ''
             archive: tar.gz
+            features: ''
     defaults:
       run:
         shell: bash
@@ -53,6 +57,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       CONFIG: ${{ matrix.config }}
       EXTENSION: ${{ matrix.extension }}
+      FEATURES: ${{ matrix.features }}
       ARCHIVE_NAME: ${{ matrix.package }}-${{ matrix.platform }}-x64
       ARCHIVE_FILE: dist/${{ matrix.package }}-${{ matrix.platform }}-x64.${{ matrix.archive }}
     steps:
@@ -64,8 +69,9 @@ jobs:
         run: rustup toolchain install stable --profile minimal --target "$TARGET"
 
       - name: Install eBPF toolchain and linker
-        if: matrix.package == 'edup-server'
-        # Keep these versions in sync with edup-server/build.rs and README.md.
+        if: matrix.package == 'edup-server' || matrix.features == 'xdp'
+        # Keep these versions in sync with edup-server/build.rs,
+        # edup-client/build.rs and README.md.
         run: |
           rustup toolchain install nightly-2026-09-26 --profile minimal --component rust-src
           curl --fail --location --retry 3 \
@@ -77,7 +83,7 @@ jobs:
           echo "$RUNNER_TEMP/bpf-linker" >> "$GITHUB_PATH"
 
       - name: Build release executable
-        run: cargo +stable build --locked --release --target "$TARGET" -p "$PACKAGE"
+        run: cargo +stable build --locked --release --target "$TARGET" -p "$PACKAGE" ${FEATURES:+--features "$FEATURES"}
 
       - name: Validate example configuration
         run: '"target/$TARGET/release/$PACKAGE$EXTENSION" --config "config/$CONFIG.example.json" check'

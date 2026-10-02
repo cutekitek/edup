@@ -13,6 +13,13 @@ use std::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    /// Datapath: `tun` (default) or, on Linux, `xdp`.
+    #[serde(default)]
+    pub mode: Mode,
+    /// How XDP attaches to the physical interface in `xdp` mode.
+    #[serde(default)]
+    #[cfg_attr(not(all(target_os = "linux", feature = "xdp")), allow(dead_code))]
+    pub xdp_mode: XdpMode,
     pub server: SocketAddr,
     pub user: i64,
     pub password: String,
@@ -39,6 +46,27 @@ pub struct Settings {
     /// Directory of the configuration file: base for rule-set paths and cache.
     #[serde(skip)]
     pub base: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Routes send traffic into the TUN device; userspace encapsulates it.
+    #[default]
+    Tun,
+    /// eBPF on the physical interface encapsulates traffic and decides routes
+    /// per destination, asking userspace about new ones.
+    Xdp,
+}
+
+/// Native XDP when the driver supports it, otherwise generic (skb) XDP.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum XdpMode {
+    #[default]
+    Auto,
+    Driver,
+    Skb,
 }
 
 #[derive(Default, Deserialize)]
@@ -262,6 +290,21 @@ impl Settings {
         if let Some(path) = &self.wintun_dll {
             ensure!(path.is_absolute(), "wintun_dll must be an absolute path");
         }
+        if self.mode == Mode::Xdp {
+            ensure!(
+                cfg!(all(target_os = "linux", feature = "xdp")),
+                "mode \"xdp\" needs Linux and a build with --features xdp"
+            );
+            // The segmentation veth pair is named after the TUN device.
+            ensure!(
+                self.interface.len() < 15,
+                "interface names in xdp mode have at most 14 characters"
+            );
+            ensure!(
+                !self.routing.is_manual(),
+                "xdp mode routes by rules: set routing.routes or default_route \"proxy\""
+            );
+        }
         self.address()?;
         for (i, rule) in self.routing.routes.iter().enumerate() {
             let domains = rule
@@ -348,6 +391,30 @@ mod tests {
         assert_eq!(c.routing.routes.len(), 1);
         assert_eq!(c.routing.routes[0].ip.len(), 3);
         assert_eq!(c.routing.routes[0].to, Action::Bypass);
+        assert_eq!((c.mode, c.xdp_mode), (Mode::Tun, XdpMode::Auto));
+    }
+    #[test]
+    fn xdp_mode() {
+        let xdp = |extra: &str| parse(&EXAMPLE.replacen('{', &format!("{{{extra},"), 1));
+        let c = xdp(r#""mode": "xdp", "xdp_mode": "skb""#).unwrap();
+        assert_eq!((c.mode, c.xdp_mode), (Mode::Xdp, XdpMode::Skb));
+        assert_eq!(
+            c.validate().is_ok(),
+            cfg!(all(target_os = "linux", feature = "xdp"))
+        );
+        assert!(xdp(r#""mode": "xdp", "xdp_mode": "native""#).is_err());
+        assert!(xdp(r#""mode": "wireguard""#).is_err());
+        let mut long = xdp(r#""mode": "xdp""#).unwrap();
+        long.interface = "edup-interface0".into();
+        assert!(long.validate().is_err());
+        long.mode = Mode::Tun;
+        long.validate().unwrap();
+        let mut manual = xdp(r#""mode": "xdp""#).unwrap();
+        manual.routing = Routing {
+            default_route: Action::Bypass,
+            routes: Vec::new(),
+        };
+        assert!(manual.validate().is_err());
     }
     #[test]
     fn addresses_are_local_and_independent_of_user_identity() {

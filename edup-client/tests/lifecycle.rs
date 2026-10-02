@@ -469,6 +469,23 @@ fn echo_peer() {
             "nodad",
         ]);
     }
+    // Addresses the peer answers itself, without the tunnel.
+    ip(&["link", "set", "lo", "up"]);
+    for address in std::env::var("EDUP_PEER_ADDRESSES")
+        .unwrap_or_default()
+        .split_whitespace()
+    {
+        let dev = if address.ends_with("/24") || address.ends_with("/64") {
+            "edup-peer0"
+        } else {
+            "lo"
+        };
+        if address.contains(':') {
+            ip(&["addr", "add", address, "dev", dev, "nodad"]);
+        } else {
+            ip(&["addr", "add", address, "dev", dev]);
+        }
+    }
     let socket = UdpSocket::bind(if ipv6 {
         "[2001:db8:1::1]:7777"
     } else {
@@ -484,6 +501,7 @@ fn echo_peer() {
     let mut keepalives = 0;
     let mut injected = false;
     let mut burst_reply = Vec::new();
+    let mut tunnelled = std::collections::BTreeSet::new();
     while !dir.join("stop").exists() {
         let (len, from) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
@@ -526,6 +544,15 @@ fn echo_peer() {
             }
         } else {
             let ip = &mut packet[..ip_len];
+            let destination = if ip[0] >> 4 == 6 {
+                IpAddr::from(<[u8; 16]>::try_from(&ip[24..40]).unwrap())
+            } else {
+                IpAddr::from(<[u8; 4]>::try_from(&ip[16..20]).unwrap())
+            };
+            if tunnelled.insert(destination) {
+                let list: String = tunnelled.iter().map(|a| format!("{a}\n")).collect();
+                fs::write(dir.join("tunnelled"), list).unwrap();
+            }
             if ip[0] >> 4 == 6 {
                 assert_eq!(l4_checksum6(ip), 0, "IPv6 TUN checksum");
                 for i in 0..16 {
@@ -603,7 +630,9 @@ fn echo_peer() {
             )
             .unwrap()
         };
-        if burst {
+        // Generic XDP sees GSO packets from a veth peer unsegmented; a
+        // server's XDP_TX sends separate datagrams.
+        if burst && std::env::var("EDUP_PEER_GSO").as_deref() != Ok("0") {
             burst_reply.extend_from_slice(&buf[..len]);
             if burst_reply.len() == 32 * len {
                 segment_size(&socket, len as libc::c_int);
@@ -793,4 +822,295 @@ fn l4_checksum6(ip: &[u8]) -> u16 {
     pseudo.extend([0, 0, 0, ip[6]]);
     pseudo.extend(&ip[40..]);
     checksum(&pseudo)
+}
+
+#[cfg(feature = "xdp")]
+#[test]
+#[ignore = "requires root, iproute2, ping, unshare, /dev/net/tun and eBPF; isolated namespaces"]
+fn isolated_xdp_client() {
+    isolated_xdp(false);
+}
+
+#[cfg(feature = "xdp")]
+#[test]
+#[ignore = "requires root, iproute2, ping, unshare, /dev/net/tun and eBPF; isolated namespaces"]
+fn isolated_xdp_ipv6_client() {
+    isolated_xdp(true);
+}
+
+/// XDP mode: eBPF on edup-test0 tunnels proxied destinations, userspace
+/// answers route lookups, and a stalled client leaves the standard route.
+#[cfg(feature = "xdp")]
+fn isolated_xdp(ipv6: bool) {
+    let test = if ipv6 {
+        "isolated_xdp_ipv6_client"
+    } else {
+        "isolated_xdp_client"
+    };
+    if std::env::var_os("EDUP_CLIENT_NS").is_none() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+        let status = Command::new("unshare")
+            .args(["--mount", "--net"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", test, "--nocapture"])
+            .env("EDUP_CLIENT_NS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    checked("mount", &["--make-rprivate", "/"]);
+    checked("mount", &["-t", "sysfs", "sysfs", "/sys"]);
+    let dir = std::env::temp_dir().join(format!("edup-xdp-test-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let mut config = include_str!("../../config/client.example.json")
+        .replace("\"keepalive_secs\": 15", "\"keepalive_secs\": 1")
+        .replacen('{', "{\"mode\": \"xdp\",", 1);
+    if ipv6 {
+        // Generic XDP here; the IPv4 run attaches natively to the veth.
+        config = config
+            .replace("\"192.0.2.1:7777\"", "\"[2001:db8:1::1]:7777\"")
+            .replace("\"mtu\": 1473", "\"mtu\": 1461")
+            .replacen('{', "{\"xdp_mode\": \"skb\",", 1);
+    }
+    fs::write(dir.join("client.json"), &config).unwrap();
+    ip(&["link", "set", "lo", "up"]);
+    ip(&[
+        "link",
+        "add",
+        "edup-test0",
+        "type",
+        "veth",
+        "peer",
+        "name",
+        "edup-peer0",
+    ]);
+    // The peer answers these itself: a second on-link address, a bypassed
+    // rule range and a destination for the stalled client.
+    let peer_addresses = if ipv6 {
+        "2001:db8:1::3/64 2001:db8:2::77/128"
+    } else {
+        "192.0.2.3/24 10.1.2.3/32 203.0.113.77/32"
+    };
+    let _peer = Process(
+        Command::new("unshare")
+            .arg("--net")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "echo_peer", "--nocapture"])
+            .env("EDUP_PEER_DIR", &dir)
+            .env("EDUP_PEER_IPV6", if ipv6 { "1" } else { "0" })
+            .env("EDUP_PEER_ADDRESSES", peer_addresses)
+            .env("EDUP_PEER_GSO", if ipv6 { "0" } else { "1" })
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(|| dir.join("peer-pid").exists());
+    let pid = fs::read_to_string(dir.join("peer-pid")).unwrap();
+    ip(&["link", "set", "edup-peer0", "netns", &pid]);
+    ip(&["addr", "add", "192.0.2.2/24", "dev", "edup-test0"]);
+    ip(&["link", "set", "edup-test0", "up"]);
+    ip(&["route", "add", "default", "via", "192.0.2.1"]);
+    if ipv6 {
+        ip(&[
+            "-6",
+            "addr",
+            "add",
+            "2001:db8:1::2/64",
+            "dev",
+            "edup-test0",
+            "nodad",
+        ]);
+        ip(&["-6", "route", "add", "default", "via", "2001:db8:1::1"]);
+    }
+    wait_for(|| dir.join("peer-ready").exists());
+    let tunnelled = |address: &str| {
+        fs::read_to_string(dir.join("tunnelled"))
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l == address)
+    };
+    let ping = |address: &str| checked("ping", &["-n", "-c", "2", "-W", "3", address]);
+    let (proxied, stalled, bypassed): (&str, &str, &[&str]) = if ipv6 {
+        ("2001:db8:2::9", "2001:db8:2::77", &["2001:db8:1::3"])
+    } else {
+        ("203.0.113.9", "203.0.113.77", &["10.1.2.3", "192.0.2.3"])
+    };
+
+    let mut first = client(&dir);
+    started(&dir, &mut first);
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    let mode = if ipv6 { "skb" } else { "driver" };
+    assert!(log.contains(&format!("({mode} XDP on edup-test0")), "{log}");
+    // No routes: the datapath decides per destination.
+    assert!(ip(&["route", "get", proxied]).contains("dev edup-test0"));
+    ping(proxied);
+    assert!(tunnelled(proxied));
+    let udp = UdpSocket::bind(if ipv6 { "[::]:0" } else { "0.0.0.0:0" }).unwrap();
+    udp.connect((proxied, 9000)).unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    // The largest inner packet fills a 1500-byte outer packet.
+    let payload = vec![0x5au8; if ipv6 { 1413 } else { 1445 }];
+    udp.send(&payload).unwrap();
+    let mut reply = [0u8; 1500];
+    let len = udp.recv(&mut reply).unwrap();
+    assert_eq!(&reply[..len], &payload);
+    // A UDP GSO packet is segmented by the kernel before encapsulation.
+    let mut burst = vec![0x6b; 32 * 1000];
+    for (i, p) in burst.chunks_mut(1000).enumerate() {
+        p[1] = i as u8;
+    }
+    segment_size(&udp, 1000);
+    assert_eq!(udp.send(&burst).unwrap(), burst.len());
+    segment_size(&udp, 0);
+    for p in burst.chunks(1000) {
+        let len = udp.recv(&mut reply).unwrap();
+        assert_eq!(&reply[..len], p);
+    }
+    // Bypass rules and on-link routes keep the standard route.
+    for address in bypassed {
+        ping(address);
+        assert!(!tunnelled(address), "{address} was tunnelled");
+    }
+
+    // A stalled client stops answering lookups; new destinations then take
+    // the standard route instead of waiting for it.
+    assert_eq!(unsafe { libc::kill(first.0.id() as i32, libc::SIGSTOP) }, 0);
+    thread::sleep(Duration::from_millis(2500));
+    ping(stalled);
+    assert!(!tunnelled(stalled));
+    assert_eq!(unsafe { libc::kill(first.0.id() as i32, libc::SIGCONT) }, 0);
+    wait_for(|| {
+        Command::new("ping")
+            .args(["-n", "-c", "1", "-W", "1", stalled])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+            && tunnelled(stalled)
+    });
+    stop(&mut first);
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    for counter in [
+        "xdp_lookup",
+        "xdp_proxy",
+        "xdp_tx_tunnel",
+        "xdp_rx_tunnel",
+        "xdp_fallback",
+    ] {
+        let value: u64 = log
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix(&format!("{counter}=")))
+            .unwrap_or_else(|| panic!("{counter} missing: {log}"))
+            .parse()
+            .unwrap();
+        assert_ne!(value, 0, "{counter}: {log}");
+    }
+    assert_clean_xdp();
+
+    if !ipv6 {
+        xdp_dns_rules(&dir, &config);
+    }
+
+    // SIGKILL leaves the veth pair behind; the next client replaces it.
+    let mut crashed = client(&dir);
+    started(&dir, &mut crashed);
+    ping(proxied);
+    crashed.0.kill().unwrap();
+    crashed.0.wait().unwrap();
+    assert!(Path::new("/sys/class/net/edup0s").exists());
+    // The datapath went away with its client's links.
+    ping(stalled);
+    let mut second = client(&dir);
+    started(&dir, &mut second);
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    assert!(log.contains("removing veth pair"), "{log}");
+    ping(proxied);
+    stop(&mut second);
+    assert_clean_xdp();
+
+    fs::write(dir.join("stop"), "").unwrap();
+    drop(_peer);
+    println!("XDP tunnel, route lookups, bypass, fallback, crash recovery and cleanup passed");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(feature = "xdp")]
+fn assert_clean_xdp() {
+    for name in ["edup0", "edup0s", "edup0e"] {
+        assert!(!Path::new("/sys/class/net").join(name).exists(), "{name}");
+    }
+    let link = ip(&["-d", "link", "show", "edup-test0"]);
+    assert!(!link.contains("xdp"), "{link}");
+    assert!(ip(&["-4", "route", "show", "default"]).contains("via 192.0.2.1 dev edup-test0"));
+}
+
+/// A domain rule overrides the address rules through the route cache.
+#[cfg(feature = "xdp")]
+fn xdp_dns_rules(dir: &Path, config: &str) {
+    let names = [("proxy.test", "198.51.100.7".parse::<IpAddr>().unwrap())];
+    let upstream = UdpSocket::bind("127.0.0.1:5353").unwrap();
+    upstream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let quit = Arc::new(AtomicBool::new(false));
+    let server = {
+        let quit = quit.clone();
+        thread::spawn(move || {
+            let mut buf = [0; 512];
+            while !quit.load(Ordering::Relaxed) {
+                if let Ok((len, from)) = upstream.recv_from(&mut buf) {
+                    upstream
+                        .send_to(&dns_answer(&buf[..len], &names), from)
+                        .unwrap();
+                }
+            }
+        })
+    };
+    fs::write(
+        dir.join("client.json"),
+        config
+            .replace(
+                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"bypass\" }",
+                "{ \"domain\": \"proxy.test\", \"to\": \"proxy\" }, { \"ip\": \"198.51.100.0/24\", \"to\": \"bypass\" }",
+            )
+            .replace(
+                "\"offload\": true,",
+                "\"offload\": true, \"dns\": { \"servers\": \"127.0.0.1:5353\", \"set_system\": false },",
+            ),
+    )
+    .unwrap();
+    let mut client = client(dir);
+    started(dir, &mut client);
+    let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    udp.send_to(&dns_query(7, "proxy.test", 1), "10.66.0.7:53")
+        .unwrap();
+    let mut reply = [0; 512];
+    let len = udp.recv(&mut reply).unwrap();
+    assert!(reply[..len].ends_with(&[198, 51, 100, 7]));
+    let tunnelled = |address: &str| {
+        fs::read_to_string(dir.join("tunnelled"))
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l == address)
+    };
+    // The answer's address is tunnelled; its bypassed neighbour is not.
+    udp.send_to(b"named", "198.51.100.7:9000").unwrap();
+    let len = udp.recv(&mut reply).unwrap();
+    assert_eq!(&reply[..len], b"named");
+    assert!(tunnelled("198.51.100.7"));
+    udp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    udp.send_to(b"unnamed", "198.51.100.8:9000").unwrap();
+    assert!(udp.recv(&mut reply).is_err());
+    assert!(!tunnelled("198.51.100.8"));
+    stop(&mut client);
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    assert!(
+        log.contains("dns_queries=1 dns_failures=0 dns_routes=1"),
+        "{log}"
+    );
+    quit.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    fs::write(dir.join("client.json"), config).unwrap();
+    assert_clean_xdp();
 }

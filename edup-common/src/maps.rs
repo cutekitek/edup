@@ -178,6 +178,86 @@ pub mod stat {
     ];
 }
 
+/// Linux client XDP mode: the single element of `CLIENT_CONFIG`.
+/// Addresses use the first four bytes for IPv4.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClientConfig {
+    pub key0: u64,
+    pub key1: u64,
+    pub user: i64,
+    /// Source address of proxied traffic: the physical route's address.
+    pub local: [u8; 16],
+    pub server: [u8; 16],
+    pub server_port_be: u16,
+    /// Port of the client's UDP socket, shared by keepalives and the datapath.
+    pub local_port_be: u16,
+    /// Largest inner packet carried through the tunnel.
+    pub mtu: u16,
+    pub v6: u8,
+    pub _pad: u8,
+    /// Physical interface: XDP ingress, TC egress and tunnel output.
+    pub physical: u32,
+    /// Veth whose disabled offloads make the kernel finish GSO and checksums.
+    pub segment: u32,
+    /// TUN device carrying route lookups to userspace.
+    pub tun: u32,
+    /// Marks packets re-injected by userspace and encapsulated packets.
+    pub mark: u32,
+}
+
+/// `ROUTES` values, keyed by a 16-byte destination address.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteEntry {
+    /// ROUTE_PENDING: time of the lookup request.
+    pub since_ns: u64,
+    pub action: u32,
+    pub _pad: u32,
+}
+
+pub const ROUTE_PENDING: u32 = 0;
+pub const ROUTE_PROXY: u32 = 1;
+pub const ROUTE_BYPASS: u32 = 2;
+
+pub const ROUTE_ENTRIES: u32 = 131_072;
+/// Userspace refreshes `HEARTBEAT`; older heartbeats mean it stopped responding.
+pub const HEARTBEAT_TIMEOUT_NS: u64 = 2 * SEC;
+/// A lookup unanswered for this long sends the destination the standard route,
+pub const LOOKUP_WAIT_NS: u64 = SEC / 2;
+/// until it is asked again.
+pub const LOOKUP_RETRY_NS: u64 = 5 * SEC;
+/// Default packet mark; any value works if policy routing does not use it.
+pub const CLIENT_MARK: u32 = 0x6564_7570;
+
+/// Indexes of the per-CPU client counters in `CLIENT_STATS`.
+pub mod client_stat {
+    pub const PROXY: u32 = 0;
+    pub const BYPASS: u32 = 1;
+    pub const LOOKUP: u32 = 2;
+    pub const FALLBACK: u32 = 3;
+    pub const TX_TUNNEL: u32 = 4;
+    pub const RX_TUNNEL: u32 = 5;
+    pub const DROP_UNSUPPORTED: u32 = 6;
+    pub const DROP_TOO_BIG: u32 = 7;
+    pub const DROP_BAD: u32 = 8;
+    pub const DROP_ADJUST: u32 = 9;
+    pub const COUNT: u32 = 10;
+
+    pub const NAMES: [&str; COUNT as usize] = [
+        "xdp_proxy",
+        "xdp_bypass",
+        "xdp_lookup",
+        "xdp_fallback",
+        "xdp_tx_tunnel",
+        "xdp_rx_tunnel",
+        "xdp_drop_unsupported",
+        "xdp_drop_too_big",
+        "xdp_drop_bad",
+        "xdp_drop_adjust",
+    ];
+}
+
 #[cfg(feature = "aya")]
 mod pod {
     use super::*;
@@ -188,6 +268,8 @@ mod pod {
     unsafe impl aya::Pod for NatOutVal {}
     unsafe impl aya::Pod for NatInKey {}
     unsafe impl aya::Pod for NatInVal {}
+    unsafe impl aya::Pod for ClientConfig {}
+    unsafe impl aya::Pod for RouteEntry {}
 }
 
 const _: () = {
@@ -197,4 +279,6 @@ const _: () = {
     assert!(core::mem::size_of::<NatOutKey>() == 8);
     assert!(core::mem::size_of::<NatInKey>() == 4);
     assert!(core::mem::size_of::<NatInVal>() == 16);
+    assert!(core::mem::size_of::<ClientConfig>() == 80);
+    assert!(core::mem::size_of::<RouteEntry>() == 16);
 };
