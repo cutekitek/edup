@@ -14,4 +14,6 @@ pub mod maps;
 pub mod wire;
 
 #[cfg(feature = "std")]
+pub mod json;
+#[cfg(feature = "std")]
 pub mod key;

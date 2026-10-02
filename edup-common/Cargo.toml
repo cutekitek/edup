@@ -7,13 +7,15 @@ license.workspace = true
 [features]
 default = []
 # Userspace (клиент и сервер): вывод ключа из пароля, работа с буферами.
-std = ["dep:blake2"]
+std = ["dep:blake2", "dep:serde", "dep:serde_json"]
 # Только серверный загрузчик на Linux: aya::Pod для структур карт.
 aya = ["std", "dep:aya"]
 
 [dependencies]
 aya = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [[example]]
 name = "xdp_check"

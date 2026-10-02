@@ -69,20 +69,13 @@ impl Settings {
     pub fn load(path: &Path) -> Result<Self> {
         let input =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Self = toml::from_str(&input).map_err(|e| {
-            // toml::Error's Display includes the original source, potentially the password.
-            let line = e.span().map(|s| {
-                input.as_bytes()[..s.start.min(input.len())]
-                    .iter()
-                    .filter(|b| **b == b'\n')
-                    .count()
-                    + 1
-            });
-            anyhow::anyhow!(
-                "invalid TOML/schema in {} at line {:?}; check field names and types",
-                path.display(),
-                line
-            )
+        let cfg: Self = edup_common::json::parse(&input).map_err(|e| {
+            let hint = if path.extension().is_some_and(|e| e == "toml") {
+                " (configuration files are JSON now; see config/server.example.json)"
+            } else {
+                ""
+            };
+            anyhow::anyhow!("invalid configuration {}: {e}{hint}", path.display())
         })?;
         cfg.validate()?;
         Ok(cfg)
@@ -223,7 +216,7 @@ fn unicast(ip: Ipv4Addr) -> bool {
 mod tests {
     use super::*;
     fn config() -> Settings {
-        toml::from_str(include_str!("../../config/server.example.toml")).unwrap()
+        edup_common::json::parse(include_str!("../../config/server.example.json")).unwrap()
     }
     #[test]
     fn example_and_byte_order() {

@@ -6,12 +6,14 @@ use crate::windows_tests::ps;
 #[ignore = "requires Administrator, EDUP_TEST_WINTUN_DLL, and EDUP_LAN_PEER running check-windows-lan-server.sh"]
 fn lan_roundtrip() -> Result<()> {
     let mut cfg: config::Settings =
-        toml::from_str(include_str!("../../config/client.example.toml"))?;
+        edup_common::json::parse(include_str!("../../config/client.example.json"))
+            .map_err(anyhow::Error::msg)?;
     cfg.server = std::env::var("EDUP_LAN_PEER")
         .context("set EDUP_LAN_PEER")?
         .parse()?;
     cfg.interface = "edup-lan-test".into();
-    cfg.routes = false;
+    cfg.routing = Default::default();
+    cfg.routing.default_route = config::Action::Bypass;
     cfg.keepalive_secs = 1;
     cfg.offload = std::env::var("EDUP_TEST_OFFLOAD").as_deref() != Ok("false");
     cfg.wintun_dll = Some(

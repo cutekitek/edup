@@ -1,0 +1,35 @@
+{
+  "server": "192.0.2.1:7777",  // Or "[2001:db8::1]:7777" for IPv6 mode
+  "user": 4829017365182049271,
+  "password": "replace-this-password",
+  // Local TUN address only; clients may all use the same address.
+  "tunnel_ip": "10.66.0.7",     // Optional; default is 10.66.0.1
+  "interface": "edup0",
+  "mtu": 1473,
+  "keepalive_secs": 15,
+  // Opportunistic Linux GSO/GRO, Windows USO/URO; false uses ordinary packets.
+  "offload": true,
+  // Windows: by default wintun.dll is loaded beside edup-client.exe.
+  // "wintun_dll": "C:\Program Files\edup\wintun.dll",
+
+  // IPv6 mode: change server to "[2001:db8::1]:7777", mtu to 1461,
+  // optional local IPv6 address (default is fd66::1):
+  // "tunnel_ip6": "fd66::7",
+  // IPv6 requires mtu >= 1280; each mode carries only its own IP family.
+
+  "routing": {
+    // "proxy" sends unmatched destinations through the tunnel; "bypass" leaves
+    // them on the physical network. "bypass" with no routes changes no routes.
+    "default_route": "proxy",
+    // The first rule containing a destination decides its route.
+    "routes": [
+      { "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"], "to": "bypass" }
+      // sing-box binary rule-sets (.srs): http(s) URL or path relative to this file.
+      // { "rules": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs", "to": "bypass" }
+      // Domain rules start a DNS forwarder; ".ru" matches subdomains of ru.
+      // { "domain": "example.com", "domain_suffix": [".ru", ".example.com"], "to": "bypass" }
+    ]
+  }
+  // Used only with domain rules. Upstream resolvers are routed like other traffic.
+  // "dns": { "servers": ["1.1.1.1", "8.8.8.8"], "set_system": true }
+}

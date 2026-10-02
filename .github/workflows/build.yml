@@ -80,13 +80,13 @@ jobs:
         run: cargo +stable build --locked --release --target "$TARGET" -p "$PACKAGE"
 
       - name: Validate example configuration
-        run: '"target/$TARGET/release/$PACKAGE$EXTENSION" --config "config/$CONFIG.example.toml" check'
+        run: '"target/$TARGET/release/$PACKAGE$EXTENSION" --config "config/$CONFIG.example.json" check'
 
       - name: Stage package
         run: |
           mkdir -p "dist/$ARCHIVE_NAME"
           cp "target/$TARGET/release/$PACKAGE$EXTENSION" "dist/$ARCHIVE_NAME/"
-          cp "config/$CONFIG.example.toml" README.md "dist/$ARCHIVE_NAME/"
+          cp "config/$CONFIG.example.json" README.md "dist/$ARCHIVE_NAME/"
           if [ "$PACKAGE" = edup-server ]; then
             cp -r deploy "dist/$ARCHIVE_NAME/"
           fi

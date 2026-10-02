@@ -224,10 +224,10 @@ fn isolated_lifecycle() {
         }
     }
     let _cleanup = Cleanup(temp.clone());
-    let config = temp.join("server.toml");
-    let original = format!(
-        "server_ip6 = \"2001:db8::1\"\nnat_ip6 = \"2001:db8::1\"\n{}",
-        include_str!("../../config/server.example.toml").replace("eth0", "edup-test0")
+    let config = temp.join("server.json");
+    let original = include_str!("../../config/server.example.json").replace(
+        "\"interface\": \"eth0\",",
+        "\"interface\": \"edup-test0\", \"server_ip6\": \"2001:db8::1\", \"nat_ip6\": \"2001:db8::1\",",
     );
     fs::write(&config, &original).unwrap();
     server(&config, "check", true);
@@ -267,9 +267,9 @@ fn isolated_lifecycle() {
 
     // Reject config/environment changes before touching active state.
     for bad in [
-        original.replace("port = 7777", "port = 20000"),
-        original.replace("max_frame = 1500", "max_frame = 1568"),
-        original.replace("xdp_mode = \"driver\"", "xdp_mode = \"skb\""),
+        original.replace("\"port\": 7777", "\"port\": 20000"),
+        original.replace("\"max_frame\": 1500", "\"max_frame\": 1568"),
+        original.replace("\"xdp_mode\": \"driver\"", "\"xdp_mode\": \"skb\""),
         original.replace("29999", "40000"),
     ] {
         fs::write(&config, bad).unwrap();
@@ -322,14 +322,16 @@ fn isolated_lifecycle() {
     )
     .unwrap();
     // Reverse the actual user records, retaining each user's password.
-    let records: Vec<_> = original.split("[[users]]").collect();
-    let revised = format!(
-        "{}[[users]]{}[[users]]{}",
-        records[0], records[2], records[1]
-    )
-    .replace("-738215604982170351", "-1234567890123456789")
-    .replace("replace-this-password", "new-password")
-    .replace("20000", "21000");
+    let user1 = r#"{ "id": 4829017365182049271, "password": "replace-this-password" }"#;
+    let user2 = r#"{ "id": -738215604982170351, "password": "replace-second-password" }"#;
+    assert!(original.contains(user1) && original.contains(user2));
+    let revised = original
+        .replace(user1, "@user1@")
+        .replace(user2, user1)
+        .replace("@user1@", user2)
+        .replace("-738215604982170351", "-1234567890123456789")
+        .replace("replace-this-password", "new-password")
+        .replace("20000", "21000");
     fs::write(&config, revised).unwrap();
     server(&config, "reload", true);
     let active = generation();
@@ -378,7 +380,7 @@ fn isolated_lifecycle() {
     // Explicit generic mode works too and leaves no attachment after down.
     fs::write(
         &config,
-        original.replace("xdp_mode = \"driver\"", "xdp_mode = \"skb\""),
+        original.replace("\"xdp_mode\": \"driver\"", "\"xdp_mode\": \"skb\""),
     )
     .unwrap();
     server(&config, "up", true);

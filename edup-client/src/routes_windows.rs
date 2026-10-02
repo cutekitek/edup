@@ -1,6 +1,19 @@
+use crate::ipset::Prefix;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use std::{net::IpAddr, os::windows::process::CommandExt, process::Command};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    os::windows::process::CommandExt,
+    process::Command,
+};
+use windows_sys::Win32::{
+    Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS},
+    NetworkManagement::IpHelper::{
+        CreateIpForwardEntry2, DeleteIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+    },
+    Networking::WinSock::{AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET},
+};
 
 // Scripts interpolate only parsed IP addresses, integer indices and a validated
 // ASCII interface name. Passwords and paths never enter PowerShell command text.
@@ -33,6 +46,50 @@ impl PhysicalRoute {
     pub fn source(&self) -> IpAddr {
         self.source
     }
+    pub fn route(&self, prefix: Prefix) -> Route {
+        Route {
+            prefix,
+            index: self.index,
+            gateway: self.gateway,
+        }
+    }
+}
+/// The preferred active default route: bypassed destinations keep using it,
+/// as they would without the tunnel's broader routes.
+#[derive(Deserialize)]
+pub struct Gateway {
+    index: u32,
+    gateway: IpAddr,
+}
+impl Gateway {
+    pub fn discover(ipv6: bool) -> Result<Self> {
+        let (prefix, family) = if ipv6 {
+            ("::/0", "IPv6")
+        } else {
+            ("0.0.0.0/0", "IPv4")
+        };
+        let text = ps(&format!(
+            "$r=@(Get-NetRoute -DestinationPrefix '{prefix}' -PolicyStore ActiveStore -ErrorAction SilentlyContinue | ForEach-Object {{$i=Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily {family} -ErrorAction SilentlyContinue; if ($i -and $i.ConnectionState -eq 'Connected') {{[pscustomobject]@{{index=[uint32]$_.InterfaceIndex; gateway=[string]$_.NextHop; metric=[uint32]($_.RouteMetric + $i.InterfaceMetric)}}}}}}) | Sort-Object metric | Select-Object -First 1; if (!$r) {{throw 'bypass routes require a default route'}}; $r | Select-Object index,gateway | ConvertTo-Json -Compress"
+        ))?;
+        serde_json::from_str(&text).context("read Windows default route")
+    }
+    pub fn route(&self, prefix: Prefix) -> Route {
+        Route {
+            prefix,
+            index: self.index,
+            gateway: self.gateway,
+        }
+    }
+}
+/// Makes the Wintun adapter the preferred DNS interface with `address` as its
+/// server. Both settings disappear with the adapter, even after a crash.
+pub fn set_dns(_interface: &str, index: u32, address: IpAddr) -> Result<()> {
+    let family = if address.is_ipv6() { "IPv6" } else { "IPv4" };
+    ps(&format!(
+        "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses '{address}'; Set-NetIPInterface -InterfaceIndex {index} -AddressFamily {family} -InterfaceMetric 1; Clear-DnsClientCache"
+    ))
+    .context("configure Windows DNS; set dns.set_system to false to configure DNS manually")?;
+    Ok(())
 }
 pub fn ensure_available(name: &str) -> Result<()> {
     let count = ps(&format!(
@@ -44,69 +101,91 @@ pub fn ensure_available(name: &str) -> Result<()> {
     );
     Ok(())
 }
-fn existing(prefix: &str) -> Result<bool> {
+/// Any active route for exactly this prefix, on any interface.
+pub fn existing(prefix: &Prefix) -> Result<bool> {
     let count = ps(&format!(
         "@(Get-NetRoute -PolicyStore ActiveStore | Where-Object {{$_.DestinationPrefix -eq '{prefix}'}}).Count"
     ))?;
     Ok(count.parse::<u32>()? != 0)
 }
+
 pub struct Route {
-    prefix: String,
+    prefix: Prefix,
     index: u32,
     gateway: IpAddr,
 }
 impl Route {
-    pub fn add(&self) -> Result<()> {
-        ps(&format!(
-            "New-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -RouteMetric 42760 -PolicyStore ActiveStore | Out-Null",
-            self.prefix, self.index, self.gateway
-        ))?;
-        Ok(())
+    pub fn tunnel(prefix: Prefix, index: u32) -> Self {
+        let gateway = if prefix.addr.is_ipv6() {
+            Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            Ipv4Addr::UNSPECIFIED.into()
+        };
+        Self {
+            prefix,
+            index,
+            gateway,
+        }
     }
-    pub fn remove(&self) -> Result<()> {
-        ps(&format!(
-            "Get-NetRoute -PolicyStore ActiveStore | Where-Object {{$_.DestinationPrefix -eq '{}' -and $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' -and $_.RouteMetric -eq 42760}} | Remove-NetRoute -Confirm:$false",
-            self.prefix, self.index, self.gateway
-        ))?;
-        Ok(())
+    fn row(&self) -> MIB_IPFORWARD_ROW2 {
+        let mut row = MIB_IPFORWARD_ROW2::default();
+        unsafe { InitializeIpForwardEntry(&mut row) };
+        row.InterfaceIndex = self.index;
+        row.DestinationPrefix.Prefix = sockaddr(self.prefix.addr);
+        row.DestinationPrefix.PrefixLength = self.prefix.len;
+        row.NextHop = sockaddr(self.gateway);
+        row.Metric = METRIC;
+        row.Protocol = MIB_IPPROTO_NETMGMT;
+        row
     }
 }
-pub fn plan(
-    physical: &PhysicalRoute,
-    _interface: &str,
-    index: u32,
-    server: IpAddr,
-) -> Result<Vec<Route>> {
-    let prefixes = if server.is_ipv6() {
-        ["::/1", "8000::/1"]
-    } else {
-        ["0.0.0.0/1", "128.0.0.0/1"]
-    };
-    for prefix in prefixes {
-        ensure!(
-            !existing(prefix)?,
-            "route {prefix} already exists; stop the other tunnel or use routes=false"
-        );
+impl fmt::Display for Route {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} via {} ifindex {}",
+            self.prefix, self.gateway, self.index
+        )
     }
-    let mut result = Vec::new();
-    let host = format!("{server}/{}", if server.is_ipv6() { 128 } else { 32 });
-    if !existing(&host)? {
-        result.push(Route {
-            prefix: host,
-            index: physical.index,
-            gateway: physical.gateway,
-        });
+}
+fn sockaddr(ip: IpAddr) -> SOCKADDR_INET {
+    let mut address = SOCKADDR_INET::default();
+    match ip {
+        IpAddr::V4(ip) => {
+            address.Ipv4.sin_family = AF_INET;
+            address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            address.Ipv6.sin6_family = AF_INET6;
+            address.Ipv6.sin6_addr.u.Byte = ip.octets();
+        }
     }
-    for prefix in prefixes {
-        result.push(Route {
-            prefix: prefix.into(),
-            index,
-            gateway: if prefix.contains(':') {
-                "::".parse().unwrap()
-            } else {
-                "0.0.0.0".parse().unwrap()
-            },
-        });
+    address
+}
+
+const METRIC: u32 = 42760;
+
+/// Active-store routes through the IP Helper API; they vanish on reboot and
+/// with the Wintun adapter, and rule-sets may need thousands of them.
+pub struct Table;
+impl Table {
+    pub fn new() -> Result<Self> {
+        Ok(Self)
     }
-    Ok(result)
+    /// Ok(false): this interface already has the route with the same next hop.
+    pub fn add(&mut self, route: &Route) -> Result<bool> {
+        match unsafe { CreateIpForwardEntry2(&route.row()) } {
+            0 => Ok(true),
+            ERROR_OBJECT_ALREADY_EXISTS => Ok(false),
+            code => Err(std::io::Error::from_raw_os_error(code as i32))
+                .with_context(|| format!("add route {route}")),
+        }
+    }
+    pub fn remove(&mut self, route: &Route) -> Result<()> {
+        match unsafe { DeleteIpForwardEntry2(&route.row()) } {
+            0 | ERROR_NOT_FOUND | ERROR_FILE_NOT_FOUND => Ok(()),
+            code => Err(std::io::Error::from_raw_os_error(code as i32))
+                .with_context(|| format!("delete route {route}")),
+        }
+    }
 }

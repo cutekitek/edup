@@ -33,7 +33,7 @@ impl Drop for TestRoute {
 #[ignore = "requires Administrator and EDUP_TEST_WINTUN_DLL; temporary adapter and TEST-NET host route"]
 fn queued_wintun_bursts_are_drained() {
     let mut cfg: config::Settings =
-        toml::from_str(include_str!("../../config/client.example.toml")).unwrap();
+        edup_common::json::parse(include_str!("../../config/client.example.json")).unwrap();
     cfg.interface = "edup-burst-test".into();
     cfg.wintun_dll = Some(
         std::env::var_os("EDUP_TEST_WINTUN_DLL")
@@ -94,7 +94,7 @@ fn queued_wintun_bursts_are_drained() {
 #[ignore = "requires Administrator and EDUP_TEST_WINTUN_DLL; creates a temporary adapter, no tunnel routes"]
 fn ipv4_mtu_below_ipv6_minimum() {
     let mut cfg: config::Settings =
-        toml::from_str(include_str!("../../config/client.example.toml")).unwrap();
+        edup_common::json::parse(include_str!("../../config/client.example.json")).unwrap();
     cfg.interface = "edup-mtu-test".into();
     cfg.mtu = 1200;
     cfg.wintun_dll = Some(
@@ -116,7 +116,10 @@ fn ipv4_mtu_below_ipv6_minimum() {
 fn live_offload() -> Result<()> {
     let path = std::env::var_os("EDUP_LIVE_CONFIG").context("set EDUP_LIVE_CONFIG")?;
     let mut cfg = config::Settings::load(std::path::Path::new(&path))?;
-    ensure!(!cfg.routes, "live test requires routes=false");
+    ensure!(
+        cfg.routing.is_manual(),
+        "live test requires default_route=bypass without routes"
+    );
     ensure!(cfg.mtu == 1400, "live test requires MTU 1400");
     cfg.interface = "edup-offload".into();
     cfg.offload = true;

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = "One-shot edup XDP loader (Linux)")]
 struct Cli {
-    #[arg(short, long, global = true, default_value = "/etc/edup/server.toml")]
+    #[arg(short, long, global = true, default_value = "/etc/edup/server.json")]
     config: PathBuf,
     #[arg(long, global = true, default_value = "/sys/fs/bpf/edup")]
     pin_path: PathBuf,
@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Validate the TOML without requiring root or touching the network.
+    /// Validate the JSON configuration without requiring root or touching the network.
     Check,
     /// Load, configure, attach and pin; exit with no daemon left running.
     Up,

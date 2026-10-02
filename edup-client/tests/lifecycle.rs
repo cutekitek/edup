@@ -3,11 +3,15 @@
 use edup_common::{key::derive_key, wire};
 use std::{
     fs,
-    net::UdpSocket,
+    io::{Read, Write},
+    net::{IpAddr, TcpListener, TcpStream, UdpSocket},
     os::fd::AsRawFd,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -51,16 +55,10 @@ fn stop(client: &mut Process) {
     assert!(status.unwrap().success());
 }
 fn client(dir: &Path) -> Process {
-    client_with_path(dir, None)
-}
-fn client_with_path(dir: &Path, path: Option<&str>) -> Process {
     let log = fs::File::create(dir.join("client.log")).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_edup-client"));
-    if let Some(path) = path {
-        cmd.env("PATH", path);
-    }
     Process(
-        cmd.args(["--config", dir.join("client.toml").to_str().unwrap(), "run"])
+        Command::new(env!("CARGO_BIN_EXE_edup-client"))
+            .args(["--config", dir.join("client.json").to_str().unwrap(), "run"])
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -83,6 +81,10 @@ fn assert_clean() {
     assert!(ip(&["-4", "route", "show", "exact", "0.0.0.0/1"]).is_empty());
     assert!(ip(&["-4", "route", "show", "exact", "128.0.0.0/1"]).is_empty());
     assert!(ip(&["-4", "route", "show", "default"]).contains("via 192.0.2.1 dev edup-test0"));
+    for family in ["-4", "-6"] {
+        let routes = ip(&[family, "route", "show"]);
+        assert!(!routes.contains("metric 42760"), "{routes}");
+    }
 }
 
 #[test]
@@ -123,20 +125,18 @@ fn isolated(ipv6: bool) {
     checked("mount", &["-t", "sysfs", "sysfs", "/sys"]);
     let dir = std::env::temp_dir().join(format!("edup-client-test-{}", std::process::id()));
     fs::create_dir(&dir).unwrap();
-    fs::write(
-        dir.join("client.toml"),
-        include_str!("../../config/client.example.toml")
-            .replace("keepalive_secs = 15", "keepalive_secs = 1"),
-    )
-    .unwrap();
+    let mut config = include_str!("../../config/client.example.json")
+        .replace("\"keepalive_secs\": 15", "\"keepalive_secs\": 1");
     if ipv6 {
-        let path = dir.join("client.toml");
-        let config = fs::read_to_string(&path)
-            .unwrap()
+        config = config
             .replace("\"192.0.2.1:7777\"", "\"[2001:db8:1::1]:7777\"")
-            .replace("mtu = 1473", "mtu = 1461");
-        fs::write(path, format!("{config}\ntunnel_ip6 = \"fd66::7\"\n")).unwrap();
+            .replace("\"mtu\": 1473", "\"mtu\": 1461")
+            .replace(
+                "\"tunnel_ip\": \"10.66.0.7\",",
+                "\"tunnel_ip\": \"10.66.0.7\", \"tunnel_ip6\": \"fd66::7\",",
+            );
     }
+    fs::write(dir.join("client.json"), &config).unwrap();
     ip(&["link", "set", "lo", "up"]);
     ip(&[
         "link",
@@ -181,7 +181,7 @@ fn isolated(ipv6: bool) {
     let mut first = client(&dir);
     started(&dir, &mut first);
     let duplicate = Command::new(env!("CARGO_BIN_EXE_edup-client"))
-        .args(["--config", dir.join("client.toml").to_str().unwrap(), "run"])
+        .args(["--config", dir.join("client.json").to_str().unwrap(), "run"])
         .output()
         .unwrap();
     assert!(!duplicate.status.success());
@@ -189,6 +189,11 @@ fn isolated(ipv6: bool) {
     let destination = if ipv6 { "2001:db8:2::9" } else { "203.0.113.9" };
     assert!(ip(&["route", "get", destination]).contains("dev edup0"));
     assert!(ip(&["route", "get", "192.0.2.1"]).contains("dev edup-test0"));
+    // The example bypasses private IPv4 ranges through the physical gateway.
+    for private in ["10.1.2.3", "172.16.0.1", "192.168.7.7"] {
+        let route = ip(&["route", "get", private]);
+        assert!(route.contains("via 192.0.2.1 dev edup-test0"), "{route}");
+    }
     checked("ping", &["-n", "-c", "2", "-W", "3", destination]);
     let udp = UdpSocket::bind(if ipv6 { "[fd66::7]:0" } else { "10.66.0.7:0" }).unwrap();
     udp.connect(if ipv6 {
@@ -241,24 +246,78 @@ fn isolated(ipv6: bool) {
         .unwrap();
     assert!(dropped >= 2, "malformed replies were not dropped: {log}");
 
-    // Fail the third route addition after the first two actually reach the kernel.
-    // Only this child sees the ip wrapper; cleanup calls use the real ip binary.
-    fs::write(dir.join("ip"), "#!/bin/sh\nif [ \"$1 $2 $3 $4\" = \"-4 route add 128.0.0.0/1\" ]; then\n  echo injected-route-failure >&2\n  exit 1\nfi\nexec /usr/bin/ip \"$@\"\n".replace("-4 route add 128.0.0.0/1", if ipv6 { "-6 route add 8000::/1" } else { "-4 route add 128.0.0.0/1" })).unwrap();
-    fs::set_permissions(dir.join("ip"), fs::Permissions::from_mode(0o755)).unwrap();
-    let mut partial = client_with_path(&dir, Some(&format!("{}:/usr/bin:/bin", dir.display())));
+    // The second tunnel route conflicts in the kernel after the first one was
+    // added; the client must remove exactly the routes it created.
+    let family = if ipv6 { "-6" } else { "-4" };
+    let (added, taken) = if ipv6 {
+        ("2001:db8:5::/48", "2001:db8:7::/48")
+    } else {
+        ("198.51.100.0/24", "198.51.102.0/24")
+    };
+    ip(&[
+        family,
+        "route",
+        "add",
+        taken,
+        "dev",
+        "edup-test0",
+        "metric",
+        "42760",
+    ]);
+    fs::write(
+        dir.join("client.json"),
+        config
+            .replace("\"default_route\": \"proxy\"", "\"default_route\": \"bypass\"")
+            .replace(
+                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"bypass\" }",
+                &format!("{{ \"ip\": [\"{added}\", \"{taken}\"], \"to\": \"proxy\" }}"),
+            ),
+    )
+    .unwrap();
+    let mut partial = client(&dir);
     let mut status = None;
     wait_for(|| {
         status = partial.0.try_wait().unwrap();
         status.is_some()
     });
     assert!(!status.unwrap().success());
-    assert!(
-        fs::read_to_string(dir.join("client.log"))
-            .unwrap()
-            .contains("injected-route-failure")
-    );
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    assert!(log.contains(&format!("route {taken} ifindex")), "{log}");
+    assert!(log.contains("already exists"), "{log}");
+    assert!(ip(&[family, "route", "show", "exact", added]).is_empty());
+    assert!(ip(&[family, "route", "show", "exact", taken]).contains("edup-test0"));
+    ip(&[
+        family,
+        "route",
+        "del",
+        taken,
+        "dev",
+        "edup-test0",
+        "metric",
+        "42760",
+    ]);
+    fs::write(dir.join("client.json"), &config).unwrap();
     assert_clean();
     assert!(ip(&["route", "show", "exact", "192.0.2.1/32"]).is_empty());
+
+    dns_rules(&dir, &config, ipv6);
+
+    // An identical bypass route, e.g. left by a crashed client, keeps its owner.
+    if !ipv6 {
+        ip(&[
+            "route",
+            "add",
+            "10.0.0.0/8",
+            "via",
+            "192.0.2.1",
+            "dev",
+            "edup-test0",
+            "metric",
+            "42760",
+            "proto",
+            "static",
+        ]);
+    }
 
     // A pre-existing server exception belongs to its owner and must survive.
     ip(&[
@@ -271,12 +330,12 @@ fn isolated(ipv6: bool) {
         "123",
     ]);
     // The same binary must still operate with all offloads explicitly disabled.
-    let path = dir.join("client.toml");
+    let path = dir.join("client.json");
     fs::write(
         &path,
         fs::read_to_string(&path)
             .unwrap()
-            .replace("offload = true", "offload = false"),
+            .replace("\"offload\": true", "\"offload\": false"),
     )
     .unwrap();
     let mut second = client(&dir);
@@ -300,6 +359,9 @@ fn isolated(ipv6: bool) {
         for prefix in ["::/1", "8000::/1", "2001:db8:1::1/128"] {
             assert!(ip(&["-6", "route", "show", "exact", prefix]).is_empty());
         }
+    } else {
+        assert!(ip(&["route", "show", "exact", "10.0.0.0/8"]).contains("metric 42760"));
+        ip(&["route", "del", "10.0.0.0/8", "metric", "42760"]);
     }
     assert_clean();
     assert!(ip(&["route", "show", "exact", "192.0.2.1/32"]).contains("metric 123"));
@@ -553,6 +615,176 @@ fn echo_peer() {
             socket.send_to(&buf[..len], from).unwrap();
         }
     }
+}
+
+/// Domain rules: the client's DNS forwarder adds host routes for answers of
+/// matched names before replying. The upstream is a fake resolver on loopback.
+fn dns_rules(dir: &Path, config: &str, ipv6: bool) {
+    let (proxied, bypassed, range, gateway, local) = if ipv6 {
+        (
+            "2001:db8:5::7",
+            "2001:db8:6::80",
+            "2001:db8:5::/48",
+            "2001:db8:1::1",
+            "[fd66::7]:53",
+        )
+    } else {
+        (
+            "198.51.100.7",
+            "203.0.113.80",
+            "198.51.100.0/24",
+            "192.0.2.1",
+            "10.66.0.7:53",
+        )
+    };
+    let family = if ipv6 { "-6" } else { "-4" };
+    let host = |ip: &str| format!("{ip}/{}", if ipv6 { 128 } else { 32 });
+    let names = [
+        ("proxy.test", proxied.parse::<IpAddr>().unwrap()),
+        ("a.bypass.test", bypassed.parse().unwrap()),
+    ];
+    let upstream_stop = Arc::new(AtomicBool::new(false));
+    let upstream = UdpSocket::bind("127.0.0.1:5353").unwrap();
+    upstream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let tcp_upstream = TcpListener::bind("127.0.0.1:5353").unwrap();
+    tcp_upstream.set_nonblocking(true).unwrap();
+    let quit = upstream_stop.clone();
+    let server = thread::spawn(move || {
+        let mut buf = [0; 512];
+        while !quit.load(Ordering::Relaxed) {
+            if let Ok((len, from)) = upstream.recv_from(&mut buf) {
+                upstream
+                    .send_to(&dns_answer(&buf[..len], &names), from)
+                    .unwrap();
+            }
+            if let Ok((mut stream, _)) = tcp_upstream.accept() {
+                stream.set_nonblocking(false).unwrap();
+                let mut len = [0; 2];
+                stream.read_exact(&mut len).unwrap();
+                let mut query = vec![0; u16::from_be_bytes(len) as usize];
+                stream.read_exact(&mut query).unwrap();
+                let reply = dns_answer(&query, &names);
+                stream
+                    .write_all(&(reply.len() as u16).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&reply).unwrap();
+            }
+        }
+    });
+    fs::write(
+        dir.join("client.json"),
+        config
+            .replace(
+                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"bypass\" }",
+                &format!(
+                    "{{ \"domain\": \"proxy.test\", \"to\": \"proxy\" }}, {{ \"ip\": \"{range}\", \"to\": \"bypass\" }}, {{ \"domain_suffix\": \".bypass.test\", \"to\": \"bypass\" }}"
+                ),
+            )
+            .replace(
+                "\"offload\": true,",
+                "\"offload\": true, \"dns\": { \"servers\": \"127.0.0.1:5353\", \"set_system\": false },",
+            ),
+    )
+    .unwrap();
+    let mut client = client(dir);
+    started(dir, &mut client);
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    assert!(log.contains(&format!("DNS={local}")), "{log}");
+    let kind = if ipv6 { 28 } else { 1 };
+    let udp = UdpSocket::bind(if ipv6 { "[::]:0" } else { "0.0.0.0:0" }).unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut reply = [0; 512];
+    // proxy.test is caught by the domain rule ahead of the bypassed range.
+    udp.send_to(&dns_query(7, "Proxy.Test", kind), local)
+        .unwrap();
+    let len = udp.recv(&mut reply).unwrap();
+    let address = proxied.parse::<IpAddr>().unwrap();
+    assert!(reply[..len].ends_with(&ip_octets(address)));
+    assert!(ip(&[family, "route", "show", "exact", &host(proxied)]).contains("dev edup0"));
+    // TCP queries take the same path.
+    let mut tcp = TcpStream::connect(local).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let query = dns_query(8, "a.bypass.test", kind);
+    tcp.write_all(&(query.len() as u16).to_be_bytes()).unwrap();
+    tcp.write_all(&query).unwrap();
+    let mut len = [0; 2];
+    tcp.read_exact(&mut len).unwrap();
+    let mut answer = vec![0; u16::from_be_bytes(len) as usize];
+    tcp.read_exact(&mut answer).unwrap();
+    assert_eq!(&answer[..2], &[0, 8]);
+    let route = ip(&[family, "route", "show", "exact", &host(bypassed)]);
+    assert!(
+        route.contains(&format!("via {gateway} dev edup-test0")),
+        "{route}"
+    );
+    // Unmatched names pass through without routes.
+    udp.send_to(&dns_query(9, "other.test", kind), local)
+        .unwrap();
+    let len = udp.recv(&mut reply).unwrap();
+    assert_eq!((reply[1], reply[3] & 15, len > 12), (9, 3, true));
+    stop(&mut client);
+    for address in [proxied, bypassed] {
+        assert!(ip(&[family, "route", "show", "exact", &host(address)]).is_empty());
+    }
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    assert!(
+        log.contains("dns_queries=3 dns_failures=0 dns_routes=2"),
+        "{log}"
+    );
+    upstream_stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    fs::write(dir.join("client.json"), config).unwrap();
+    assert_clean();
+}
+
+fn ip_octets(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
+fn dns_query(id: u16, name: &str, kind: u16) -> Vec<u8> {
+    let mut m = id.to_be_bytes().to_vec();
+    m.extend([1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    for label in name.split('.') {
+        m.push(label.len() as u8);
+        m.extend(label.bytes());
+    }
+    m.push(0);
+    m.extend(kind.to_be_bytes());
+    m.extend([0, 1]);
+    m
+}
+
+/// Answers a single-question query from `names`, or NXDOMAIN.
+fn dns_answer(query: &[u8], names: &[(&str, IpAddr)]) -> Vec<u8> {
+    let mut pos = 12;
+    let mut name = Vec::new();
+    while query[pos] != 0 {
+        let len = query[pos] as usize;
+        name.push(String::from_utf8_lossy(&query[pos + 1..pos + 1 + len]).to_lowercase());
+        pos += 1 + len;
+    }
+    let end = pos + 5;
+    let mut reply = query[..end].to_vec();
+    reply[2] |= 0x80;
+    reply[3] = 0x80;
+    reply[10..12].fill(0);
+    match names.iter().find(|(n, _)| *n == name.join(".")) {
+        Some((_, ip)) => {
+            let data = ip_octets(*ip);
+            reply[7] = 1;
+            reply.extend([0xc0, 12]);
+            reply.extend(&query[end - 4..end - 2]);
+            reply.extend([0, 1, 0, 0, 0, 60, 0, data.len() as u8]);
+            reply.extend(data);
+        }
+        None => reply[3] |= 3,
+    }
+    reply
 }
 
 fn l4_checksum6(ip: &[u8]) -> u16 {

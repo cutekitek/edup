@@ -1,9 +1,13 @@
+use crate::{domain::DomainMatcher, ipset::Prefix};
 use anyhow::{Context, Result, ensure};
 use edup_common::wire;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use std::{
+    fmt,
+    marker::PhantomData,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 #[derive(Deserialize)]
@@ -22,14 +26,147 @@ pub struct Settings {
     pub mtu: u16,
     #[serde(default = "keepalive")]
     pub keepalive_secs: u64,
-    #[serde(default = "routes")]
-    pub routes: bool,
     /// Opportunistic UDP segmentation/coalescing (GSO/GRO or USO/URO).
     #[serde(default = "offload")]
     pub offload: bool,
     /// Windows: absolute DLL path. Default is beside the executable, never CWD.
     pub wintun_dll: Option<PathBuf>,
+    #[serde(default)]
+    pub routing: Routing,
+    /// DNS forwarder, active only when routing uses domain rules.
+    #[serde(default)]
+    pub dns: Dns,
+    /// Directory of the configuration file: base for rule-set paths and cache.
+    #[serde(skip)]
+    pub base: PathBuf,
 }
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Routing {
+    /// Destination for addresses no rule matches.
+    #[serde(default)]
+    pub default_route: Action,
+    /// Ordered rules; the first rule containing an address decides its route.
+    #[serde(default)]
+    pub routes: Vec<RouteRule>,
+}
+impl Routing {
+    /// No system routes are changed; the user routes traffic into the TUN.
+    pub fn is_manual(&self) -> bool {
+        self.default_route == Action::Bypass && self.routes.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    #[default]
+    Proxy,
+    Bypass,
+}
+impl Action {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Proxy => "proxy",
+            Self::Bypass => "bypass",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRule {
+    /// CIDR prefixes or single addresses.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub ip: Vec<Prefix>,
+    /// sing-box binary rule-sets: http(s) URLs or paths relative to the config.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub rules: Vec<String>,
+    /// Exact names.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub domain: Vec<String>,
+    /// `".ru"`: subdomains of ru; `"ru"`: ru itself too.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub domain_suffix: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub domain_keyword: Vec<String>,
+    pub to: Action,
+}
+impl RouteRule {
+    pub fn domains(&self) -> Result<DomainMatcher> {
+        let mut matcher = DomainMatcher::default();
+        self.domain.iter().try_for_each(|d| matcher.add_domain(d))?;
+        self.domain_suffix
+            .iter()
+            .try_for_each(|d| matcher.add_suffix(d))?;
+        self.domain_keyword
+            .iter()
+            .try_for_each(|d| matcher.add_keyword(d))?;
+        Ok(matcher)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dns {
+    /// Upstream resolvers, `"1.1.1.1"` or `"1.1.1.1:53"`; routed like any traffic.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub servers: Vec<Upstream>,
+    /// Point the system resolver at the forwarder through the TUN interface.
+    #[serde(default = "set_system")]
+    pub set_system: bool,
+}
+impl Default for Dns {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
+            set_system: true,
+        }
+    }
+}
+fn set_system() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Upstream(pub SocketAddr);
+impl FromStr for Upstream {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        s.parse::<SocketAddr>()
+            .or_else(|_| s.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+            .map(Self)
+            .map_err(|_| format!("invalid DNS server {s:?}"))
+    }
+}
+
+/// Accepts `"value"` or `["value", ...]`, keeping parse errors positioned.
+fn one_or_many<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr<Err: fmt::Display>,
+{
+    struct Visitor<T>(PhantomData<T>);
+    impl<'de, T: FromStr<Err: fmt::Display>> de::Visitor<'de> for Visitor<T> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string or an array of strings")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<T>, E> {
+            Ok(vec![v.parse().map_err(E::custom)?])
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(v) = seq.next_element::<String>()? {
+                out.push(v.parse().map_err(de::Error::custom)?);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_any(Visitor(PhantomData))
+}
+
 fn tunnel_ip() -> Ipv4Addr {
     Ipv4Addr::new(10, 66, 0, 1)
 }
@@ -45,9 +182,6 @@ fn mtu() -> u16 {
 fn keepalive() -> u64 {
     15
 }
-fn routes() -> bool {
-    true
-}
 fn offload() -> bool {
     true
 }
@@ -56,19 +190,19 @@ impl Settings {
     pub fn load(path: &Path) -> Result<Self> {
         let input =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Self = toml::from_str(&input).map_err(|e| {
-            let line = e.span().map(|s| {
-                input.as_bytes()[..s.start.min(input.len())]
-                    .iter()
-                    .filter(|b| **b == b'\n')
-                    .count()
-                    + 1
-            });
-            anyhow::anyhow!(
-                "invalid TOML/schema in {} at line {line:?}; check names and types",
-                path.display()
-            )
+        let mut cfg: Self = edup_common::json::parse(&input).map_err(|e| {
+            let hint = if path.extension().is_some_and(|e| e == "toml") {
+                " (configuration files are JSON now; see config/client.example.json)"
+            } else {
+                ""
+            };
+            anyhow::anyhow!("invalid configuration {}: {e}{hint}", path.display())
         })?;
+        cfg.base = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -129,7 +263,48 @@ impl Settings {
             ensure!(path.is_absolute(), "wintun_dll must be an absolute path");
         }
         self.address()?;
+        for (i, rule) in self.routing.routes.iter().enumerate() {
+            let domains = rule
+                .domains()
+                .with_context(|| format!("routing.routes[{i}]"))?;
+            ensure!(
+                !rule.ip.is_empty() || !rule.rules.is_empty() || !domains.is_empty(),
+                "routing.routes[{i}] needs \"ip\", \"rules\" or a domain item"
+            );
+            for source in &rule.rules {
+                ensure!(
+                    crate::ruleset::is_url(source)
+                        || !(source.is_empty() || source.contains("://")),
+                    "routing.routes[{i}]: rules must be an http(s) URL or a file path"
+                );
+            }
+        }
+        for Upstream(server) in &self.dns.servers {
+            ensure!(
+                !server.ip().is_unspecified() && server.port() != 0,
+                "invalid DNS server {server}"
+            );
+        }
         Ok(())
+    }
+
+    /// Upstream resolvers; public resolvers of the tunnel's family by default.
+    pub fn dns_servers(&self) -> Vec<SocketAddr> {
+        if !self.dns.servers.is_empty() {
+            return self.dns.servers.iter().map(|u| u.0).collect();
+        }
+        let defaults: [IpAddr; 2] = if self.server.is_ipv6() {
+            [
+                "2606:4700:4700::1111".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+            ]
+        } else {
+            [
+                Ipv4Addr::new(1, 1, 1, 1).into(),
+                Ipv4Addr::new(8, 8, 8, 8).into(),
+            ]
+        };
+        defaults.map(|ip| SocketAddr::new(ip, 53)).to_vec()
     }
 
     pub fn address6(&self) -> Result<Option<Ipv6Addr>> {
@@ -151,8 +326,12 @@ fn unicast(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const EXAMPLE: &str = include_str!("../../config/client.example.json");
+    fn parse(text: &str) -> Result<Settings, String> {
+        edup_common::json::parse(text)
+    }
     fn cfg() -> Settings {
-        toml::from_str(include_str!("../../config/client.example.toml")).unwrap()
+        parse(EXAMPLE).unwrap()
     }
     #[test]
     fn example_defaults_and_address() {
@@ -161,17 +340,14 @@ mod tests {
         assert_eq!(c.address().unwrap(), Ipv4Addr::new(10, 66, 0, 7));
         assert_eq!(c.mtu, 1473);
         assert!(c.offload);
-        let legacy: Settings = toml::from_str(
-            &include_str!("../../config/client.example.toml").replace("offload = true", ""),
-        )
-        .unwrap();
+        let legacy = parse(&EXAMPLE.replace("\"offload\": true,", "")).unwrap();
         assert!(legacy.offload);
-        let disabled: Settings = toml::from_str(
-            &include_str!("../../config/client.example.toml")
-                .replace("offload = true", "offload = false"),
-        )
-        .unwrap();
+        let disabled = parse(&EXAMPLE.replace("\"offload\": true", "\"offload\": false")).unwrap();
         assert!(!disabled.offload);
+        assert_eq!(c.routing.default_route, Action::Proxy);
+        assert_eq!(c.routing.routes.len(), 1);
+        assert_eq!(c.routing.routes[0].ip.len(), 3);
+        assert_eq!(c.routing.routes[0].to, Action::Bypass);
     }
     #[test]
     fn addresses_are_local_and_independent_of_user_identity() {
@@ -182,19 +358,102 @@ mod tests {
             c.validate().unwrap();
             assert_eq!(c.address().unwrap().to_string(), "172.19.8.23");
         }
-        let defaults: Settings =
-            toml::from_str("server = '192.0.2.1:7777'\nuser = 1\npassword = 'test'").unwrap();
+        let defaults =
+            parse(r#"{"server": "192.0.2.1:7777", "user": 1, "password": "test"}"#).unwrap();
         assert_eq!(defaults.address().unwrap(), tunnel_ip());
-        // Former addressing fields must fail instead of being silently ignored.
-        for field in ["tunnel_id = 7", "tunnel_net = '10.66.0.0/16'"] {
-            assert!(
-                toml::from_str::<Settings>(&format!(
-                    "{}\n{field}",
-                    include_str!("../../config/client.example.toml")
-                ))
-                .is_err()
-            );
+        assert_eq!(defaults.routing.default_route, Action::Proxy);
+        assert!(defaults.routing.routes.is_empty());
+        // Former fields must fail instead of being silently ignored.
+        for field in [
+            r#""tunnel_id": 7"#,
+            r#""tunnel_net": "10.66.0.0/16""#,
+            r#""routes": false"#,
+        ] {
+            assert!(parse(&EXAMPLE.replacen('{', &format!("{{{field},"), 1)).is_err());
         }
+    }
+    #[test]
+    fn routing_rules() {
+        let c = parse(
+            r#"{"server": "192.0.2.1:7777", "user": 1, "password": "test",
+            "routing": {"default_route": "bypass", "routes": [
+                {"ip": "192.168.1.0/24", "to": "proxy"},
+                {"rules": "https://example.com/geoip-ru.srs", "to": "bypass"},
+                {"rules": ["local.srs", "C:\\rules\\a.srs"], "ip": ["2001:db8::/32"], "to": "proxy"}
+            ]}}"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.routing.default_route, Action::Bypass);
+        assert_eq!(c.routing.routes[0].ip[0].to_string(), "192.168.1.0/24");
+        assert_eq!(c.routing.routes[2].rules, ["local.srs", "C:\\rules\\a.srs"]);
+        let rule = |r: &str| {
+            format!(
+                r#"{{"server": "192.0.2.1:7777", "user": 1, "password": "secret", "routing": {{"routes": [{r}]}}}}"#
+            )
+        };
+        let manual = parse(&rule("").replace("\"routes\": []", "\"default_route\": \"bypass\""));
+        assert!(manual.unwrap().routing.is_manual());
+        let Err(error) = parse(&rule(r#"{"ip": "192.168.1.0/235", "to": "proxy"}"#)) else {
+            panic!("invalid prefix accepted");
+        };
+        assert!(
+            error.contains("invalid prefix length") && error.contains("line 1"),
+            "{error}"
+        );
+        for bad in [
+            r#"{"ip": "192.168.1.0/24", "to": "tunnel"}"#,
+            r#"{"ip": "192.168.1.0/24"}"#,
+            r#"{"ip": 5, "to": "proxy"}"#,
+            r#"{"ip": "x", "to": "proxy"}"#,
+            r#"{"ip": "10.0.0.0/8", "to": "proxy", "port": 80}"#,
+        ] {
+            assert!(parse(&rule(bad)).is_err(), "{bad}");
+        }
+        for bad in [
+            r#"{"to": "proxy"}"#,
+            r#"{"ip": [], "rules": [], "to": "proxy"}"#,
+            r#"{"rules": "ftp://example.com/a.srs", "to": "proxy"}"#,
+            r#"{"rules": "", "to": "proxy"}"#,
+            r#"{"domain": "a..ru", "to": "proxy"}"#,
+            r#"{"domain": "*.ru", "to": "proxy"}"#,
+            r#"{"domain_suffix": "*.", "to": "proxy"}"#,
+            r#"{"domain_suffix": "*.ru", "to": "proxy"}"#,
+            r#"{"domain": [], "to": "proxy"}"#,
+        ] {
+            assert!(parse(&rule(bad)).unwrap().validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn domain_rules_and_dns() {
+        let c = parse(
+            r#"{"server": "192.0.2.1:7777", "user": 1, "password": "test",
+            "routing": {"routes": [
+                {"domain_suffix": ".ru", "domain": "example.ru", "to": "bypass"},
+                {"domain_keyword": "ads", "domain_suffix": [".cdn.example.com"], "to": "proxy"}
+            ]},
+            "dns": {"servers": ["9.9.9.9", "[2620:fe::fe]:5353"], "set_system": false}}"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        let first = c.routing.routes[0].domains().unwrap();
+        assert!(first.matches("example.ru") && first.matches("a.b.ru") && !first.matches("ru"));
+        let second = c.routing.routes[1].domains().unwrap();
+        assert!(second.matches("myads.com") && second.matches("a.cdn.example.com"));
+        assert!(!second.matches("cdn.example.com"));
+        assert_eq!(
+            c.dns_servers(),
+            [
+                "9.9.9.9:53".parse::<SocketAddr>().unwrap(),
+                "[2620:fe::fe]:5353".parse().unwrap()
+            ]
+        );
+        assert!(!c.dns.set_system);
+        let defaults = cfg();
+        assert!(defaults.dns.set_system);
+        assert_eq!(defaults.dns_servers()[0].to_string(), "1.1.1.1:53");
+        assert!(parse(&EXAMPLE.replacen('{', r#"{"dns": {"servers": "dns.google"},"#, 1)).is_err());
     }
     #[test]
     fn invalid_configuration() {

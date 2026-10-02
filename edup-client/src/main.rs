@@ -1,6 +1,11 @@
 mod config;
+mod dns;
+mod domain;
+mod ipset;
 mod packet;
 mod routes;
+mod routing;
+mod ruleset;
 mod tun_io;
 mod udp;
 #[cfg(target_os = "windows")]
@@ -19,7 +24,7 @@ use std::{
     net::UdpSocket,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::{Duration, Instant},
@@ -29,7 +34,7 @@ use tun_rs::{DeviceBuilder, InterruptEvent, Layer, SyncDevice};
 #[derive(Parser)]
 #[command(version, about = "edup dual-stack TUN client for Linux and Windows")]
 struct Cli {
-    #[arg(short, long, global = true, default_value = "client.toml")]
+    #[arg(short, long, global = true, default_value = "client.json")]
     config: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -80,18 +85,39 @@ fn main() -> Result<()> {
         getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generate credentials: {e}"))?;
         let id = i64::from_ne_bytes(bytes[..8].try_into().unwrap());
         let password: String = bytes[8..].iter().map(|b| format!("{b:02x}")).collect();
-        println!("user = {id}\npassword = \"{password}\"");
+        println!("\"user\": {id},\n\"password\": \"{password}\"");
         return Ok(());
     }
     let cfg = config::Settings::load(&cli.config)?;
     match cli.command {
         Command::Check => {
+            let routing = if cfg.routing.is_manual() {
+                "manual".to_string()
+            } else {
+                let rules = routing::resolve(&cfg)?;
+                let plan = rules.plan();
+                let mut text = format!(
+                    "default {}, {} rules: {} tunnel and {} bypass routes",
+                    cfg.routing.default_route.name(),
+                    cfg.routing.routes.len(),
+                    plan.tunnel.len(),
+                    plan.bypass.len() + usize::from(plan.server_exception),
+                );
+                if rules.uses_dns() {
+                    let servers: Vec<_> = cfg.dns_servers().iter().map(|s| s.to_string()).collect();
+                    text += &format!(
+                        ", {} domain entries via DNS forwarder (upstream {})",
+                        rules.domain_count(),
+                        servers.join(", ")
+                    );
+                }
+                text
+            };
             println!(
-                "Configuration valid: {} -> {}, MTU={}, routes={}",
+                "Configuration valid: {} -> {}, MTU={}, routing: {routing}",
                 tunnel_address(&cfg)?,
                 cfg.server,
                 cfg.mtu,
-                cfg.routes
             );
             Ok(())
         }
@@ -110,6 +136,9 @@ fn run(cfg: config::Settings) -> Result<()> {
     })
     .context("install shutdown handler")?;
     routes::ensure_available(&cfg.interface)?;
+    // Rule-sets download before any route can capture the traffic.
+    let rules = routing::resolve(&cfg)?;
+    let plan = rules.plan();
     let physical = routes::PhysicalRoute::discover(cfg.server.ip())?;
     let socket =
         UdpSocket::bind((physical.source(), 0)).context("bind UDP on physical source address")?;
@@ -128,23 +157,44 @@ fn run(cfg: config::Settings) -> Result<()> {
     let socket = udp::Transport::new(socket, cfg.offload).context("configure UDP offload")?;
     let address = tunnel_address(&cfg)?;
     let tun = create_device(&cfg)?;
-    let mut routes = if cfg.routes {
-        Some(routes::Routes::install(
-            &physical,
-            &cfg.interface,
-            tun.if_index()?,
-            cfg.server.ip(),
-        )?)
+    let index = tun.if_index()?;
+    let routes = Mutex::new(routes::Routes::install(
+        &physical,
+        index,
+        cfg.server.ip(),
+        &plan,
+    )?);
+    let dns = if rules.uses_dns() {
+        let listener = dns::Listener::bind(address)?;
+        if cfg.dns.set_system {
+            routes::set_dns(&cfg.interface, index, address)?;
+        }
+        Some((
+            dns::Forwarder::new(&rules, &routes, cfg.dns_servers()),
+            listener,
+        ))
     } else {
         None
     };
     let counts = Counters::default();
     let key = derive_key(&cfg.password);
     println!(
-        "edup client ready: {} {}, server={}, MTU={}",
-        cfg.interface, address, cfg.server, cfg.mtu
+        "edup client ready: {} {}, server={}, MTU={}, routes={}{}",
+        cfg.interface,
+        address,
+        cfg.server,
+        cfg.mtu,
+        routes.lock().unwrap().len(),
+        if dns.is_some() {
+            format!(", DNS={}", std::net::SocketAddr::new(address, 53))
+        } else {
+            String::new()
+        }
     );
     let result = std::thread::scope(|scope| {
+        if let Some((forwarder, listener)) = &dns {
+            forwarder.spawn(scope, listener, &stop);
+        }
         let worker = scope.spawn(|| {
             let result = send_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event);
             stop.store(true, Relaxed);
@@ -159,11 +209,18 @@ fn run(cfg: config::Settings) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("TUN sender panicked"))?;
         result.and(sent)
     });
-    let cleanup = if let Some(routes) = &mut routes {
-        routes.clear()
-    } else {
-        Ok(())
+    let mut routes = {
+        if let Some((forwarder, _)) = dns {
+            eprintln!(
+                "dns_queries={} dns_failures={} dns_routes={}",
+                forwarder.queries.load(Relaxed),
+                forwarder.failures.load(Relaxed),
+                routes.lock().unwrap_or_else(|e| e.into_inner()).hosts()
+            );
+        }
+        routes.into_inner().unwrap_or_else(|e| e.into_inner())
     };
+    let cleanup = routes.clear();
     counts.report();
     report_offload(&socket);
     result.and(cleanup)
@@ -550,7 +607,7 @@ mod receive_tests {
     #[test]
     fn coalesced_messages_are_validated_independently() {
         let cfg: config::Settings =
-            toml::from_str(include_str!("../../config/client.example.toml")).unwrap();
+            edup_common::json::parse(include_str!("../../config/client.example.json")).unwrap();
         let key = derive_key(&cfg.password);
         let address = cfg.address().unwrap().octets();
         let mut aggregate = Vec::new();

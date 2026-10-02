@@ -8,8 +8,8 @@ RequiresMountsFor=/sys/fs/bpf
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/edup-server --config /etc/edup/server.toml up
-ExecReload=/usr/local/sbin/edup-server --config /etc/edup/server.toml reload
+ExecStart=/usr/local/sbin/edup-server --config /etc/edup/server.json up
+ExecReload=/usr/local/sbin/edup-server --config /etc/edup/server.json reload
 ExecStop=/usr/local/sbin/edup-server down
 User=root
 Group=root
