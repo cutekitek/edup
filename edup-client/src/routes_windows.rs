@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
     fmt,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::windows::process::CommandExt,
     process::Command,
 };
@@ -83,13 +83,25 @@ impl Gateway {
 }
 /// Makes the Wintun adapter the preferred DNS interface with `address` as its
 /// server. Both settings disappear with the adapter, even after a crash.
-pub fn set_dns(_interface: &str, index: u32, address: IpAddr) -> Result<()> {
+/// Nothing to restore: the settings disappear with the adapter.
+pub enum DnsRestore {}
+pub fn clean_dns() -> Result<()> {
+    Ok(())
+}
+
+pub fn set_dns(_interface: &str, index: u32, forwarder: SocketAddr) -> Result<Option<DnsRestore>> {
+    // Adapter DNS servers have no port.
+    ensure!(
+        forwarder.port() == 53,
+        "dns.port must be 53 for dns.set_system on Windows"
+    );
+    let address = forwarder.ip();
     let family = if address.is_ipv6() { "IPv6" } else { "IPv4" };
     ps(&format!(
         "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses '{address}'; Set-NetIPInterface -InterfaceIndex {index} -AddressFamily {family} -InterfaceMetric 1; Clear-DnsClientCache"
     ))
     .context("configure Windows DNS; set dns.set_system to false to configure DNS manually")?;
-    Ok(())
+    Ok(None)
 }
 pub fn ensure_available(name: &str) -> Result<()> {
     let count = ps(&format!(

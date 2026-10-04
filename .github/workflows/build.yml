@@ -123,3 +123,81 @@ jobs:
         run: |
           echo "### Download" >> "$GITHUB_STEP_SUMMARY"
           echo "[$(basename "$ARCHIVE_FILE")]($ARTIFACT_URL)" >> "$GITHUB_STEP_SUMMARY"
+
+  openwrt:
+    name: edup-client (openwrt-aarch64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARCHIVE_NAME: edup-client-openwrt-aarch64
+      ARCHIVE_FILE: dist/edup-client-openwrt-aarch64.tar.gz
+      # Keep in sync with scripts/build-openwrt.sh and README.md.
+      ZIG_VERSION: 0.15.2
+      ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+      SDK_NAME: openwrt-sdk-25.12.2-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64
+      SDK_URL: https://downloads.openwrt.org/releases/25.12.2/targets/mediatek/filogic
+      SDK_SHA256: 56e60bb1bfac3eb379cbabc3fff126ac2b749b746b007268b27aba2df9d31a4f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-musl
+
+      - name: Install eBPF toolchain and linker
+        # Keep these versions in sync with the build job above.
+        run: |
+          rustup toolchain install nightly-2026-09-26 --profile minimal --component rust-src
+          curl --fail --location --retry 3 \
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+            --output "$RUNNER_TEMP/bpf-linker.tar.zst"
+          echo "e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/bpf-linker"
+          tar --zstd -xf "$RUNNER_TEMP/bpf-linker.tar.zst" -C "$RUNNER_TEMP/bpf-linker"
+          echo "$RUNNER_TEMP/bpf-linker" >> "$GITHUB_PATH"
+
+      - name: Install zig and cargo-zigbuild
+        run: |
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+            --output "$RUNNER_TEMP/zig.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+          cargo +stable install --locked cargo-zigbuild --version 0.23.4
+
+      - name: Install OpenWrt SDK
+        run: |
+          sudo apt-get update && sudo apt-get install --yes gawk zstd
+          curl --fail --location --retry 3 "$SDK_URL/$SDK_NAME.tar.zst" --output "$RUNNER_TEMP/sdk.tar.zst"
+          echo "$SDK_SHA256  $RUNNER_TEMP/sdk.tar.zst" | sha256sum --check
+          tar --zstd -xf "$RUNNER_TEMP/sdk.tar.zst" -C "$RUNNER_TEMP"
+
+      - name: Build executable and apk packages
+        run: SDK="$RUNNER_TEMP/$SDK_NAME" sh scripts/build-openwrt.sh
+
+      - name: Stage package
+        run: |
+          mkdir -p "dist/$ARCHIVE_NAME"
+          cp dist/openwrt/edup-client dist/openwrt/*.apk README.md "dist/$ARCHIVE_NAME/"
+          cp openwrt/edup-client/files/edup.config "dist/$ARCHIVE_NAME/edup.config.example"
+          tar -czf "$ARCHIVE_FILE" -C dist "$ARCHIVE_NAME"
+
+      - name: Upload executable package
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ env.ARCHIVE_FILE }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Link artifact in job summary
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          echo "### Download" >> "$GITHUB_STEP_SUMMARY"
+          echo "[$(basename "$ARCHIVE_FILE")]($ARTIFACT_URL)" >> "$GITHUB_STEP_SUMMARY"

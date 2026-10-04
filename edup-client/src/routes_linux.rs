@@ -3,8 +3,9 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
     fmt, io,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -158,15 +159,53 @@ pub fn device_prefixes(dev: &str, ipv6: bool) -> Result<Vec<Prefix>> {
         .filter(|p| p.len != 0)
         .collect())
 }
+/// Main-table device routes of every interface, without default routes:
+/// the networks each interface reaches directly.
+#[cfg_attr(not(feature = "xdp"), allow(dead_code))]
+pub fn interface_prefixes(ipv6: bool) -> Result<Vec<(String, Prefix)>> {
+    #[derive(Deserialize)]
+    struct Entry {
+        dst: String,
+        dev: Option<String>,
+        gateway: Option<IpAddr>,
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    let json = ip(&args(&[
+        "-j",
+        if ipv6 { "-6" } else { "-4" },
+        "route",
+        "show",
+        "table",
+        "main",
+    ]))?;
+    let routes: Vec<Entry> = serde_json::from_str(&json).context("read routes")?;
+    Ok(routes
+        .into_iter()
+        .filter(|r| r.gateway.is_none() && r.kind.as_deref().is_none_or(|k| k == "unicast"))
+        .filter_map(|r| Some((r.dev?, r.dst.parse::<Prefix>().ok()?)))
+        .filter(|(_, p)| p.len != 0)
+        .collect())
+}
 fn if_index(name: &str) -> Result<u32> {
     let c = std::ffi::CString::new(name)?;
     let index = unsafe { libc::if_nametoindex(c.as_ptr()) };
     ensure!(index != 0, "interface {name} not found");
     Ok(index)
 }
-/// Sends all names to `address` through systemd-resolved's settings for the
-/// TUN link, which disappear with the link even if the client crashes.
-pub fn set_dns(interface: &str, _index: u32, address: IpAddr) -> Result<()> {
+/// Sends all names to `forwarder` through systemd-resolved's settings for the
+/// TUN link, which disappear with the link even if the client crashes. On
+/// OpenWrt, dnsmasq forwards to `forwarder` until the result is dropped.
+pub fn set_dns(interface: &str, _index: u32, forwarder: SocketAddr) -> Result<Option<DnsRestore>> {
+    if openwrt() {
+        return dnsmasq(forwarder).map(Some);
+    }
+    // systemd 246 and newer take a port.
+    let server = if forwarder.port() == 53 {
+        forwarder.ip().to_string()
+    } else {
+        forwarder.to_string()
+    };
     let resolvectl = |args: &[&str]| -> Result<()> {
         let out = Command::new("resolvectl")
             .args(args)
@@ -180,7 +219,7 @@ pub fn set_dns(interface: &str, _index: u32, address: IpAddr) -> Result<()> {
         );
         Ok(())
     };
-    resolvectl(&["dns", interface, &address.to_string()])
+    resolvectl(&["dns", interface, &server])
         .and_then(|()| resolvectl(&["domain", interface, "~."]))
         .context(
             "configure systemd-resolved; set dns.set_system to false to configure DNS manually",
@@ -194,9 +233,145 @@ pub fn set_dns(interface: &str, _index: u32, address: IpAddr) -> Result<()> {
         .any(|l| l.split_whitespace().eq(["nameserver", "127.0.0.53"]));
     if !stub {
         eprintln!(
-            "warning: /etc/resolv.conf does not use the systemd-resolved stub; programs reading it bypass the DNS forwarder at {address}"
+            "warning: /etc/resolv.conf does not use the systemd-resolved stub; programs reading it bypass the DNS forwarder at {forwarder}"
         );
     }
+    Ok(None)
+}
+
+/// File in each dnsmasq instance's `conf-dir` (OpenWrt: /tmp, gone at reboot).
+const DNSMASQ_FILE: &str = "edup.conf";
+
+/// OpenWrt's dnsmasq forwarding every name to the forwarder. A crashed
+/// client leaves the file behind; [`clean_dns`] removes it at the next start.
+pub struct DnsRestore {
+    files: Vec<PathBuf>,
+}
+impl Drop for DnsRestore {
+    fn drop(&mut self) {
+        for file in &self.files {
+            if let Err(error) = std::fs::remove_file(file)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                eprintln!("remove {}: {error}", file.display());
+            }
+        }
+        if let Err(error) = restart_dnsmasq() {
+            eprintln!("DNS cleanup failed: {error:#}");
+        }
+    }
+}
+
+fn openwrt() -> bool {
+    Path::new("/etc/openwrt_release").exists()
+}
+
+/// Lines of the configurations /etc/init.d/dnsmasq writes, one per instance.
+fn dnsmasq_settings() -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir("/var/etc").context("read /var/etc")? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("dnsmasq.conf."))
+        {
+            lines.extend(std::fs::read_to_string(&path)?.lines().map(String::from));
+        }
+    }
+    Ok(lines)
+}
+
+fn dnsmasq_dirs() -> Result<Vec<PathBuf>> {
+    Ok(dnsmasq_settings()?
+        .iter()
+        .filter_map(|line| line.strip_prefix("conf-dir="))
+        // conf-dir=<dir>[,<extension filter>...]
+        .map(|dir| PathBuf::from(dir.split(',').next().unwrap_or_default()))
+        .collect())
+}
+
+/// On OpenWrt, removes the dnsmasq settings a crashed client left behind:
+/// dnsmasq would otherwise keep forwarding to a forwarder that is gone.
+pub fn clean_dns() -> Result<()> {
+    if !openwrt() {
+        return Ok(());
+    }
+    let mut removed = false;
+    for dir in dnsmasq_dirs()? {
+        let file = dir.join(DNSMASQ_FILE);
+        match std::fs::remove_file(&file) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("remove {}", file.display())),
+        }
+    }
+    if removed {
+        eprintln!("removing dnsmasq settings left by an earlier client");
+        restart_dnsmasq()?;
+    }
+    Ok(())
+}
+
+/// Plain upstream addresses dnsmasq forwards to on OpenWrt: from the WAN
+/// (resolv.conf.auto) and configured forwards, not per-domain servers.
+#[cfg_attr(not(feature = "xdp"), allow(dead_code))]
+pub fn dnsmasq_upstreams() -> Vec<IpAddr> {
+    if !openwrt() {
+        return Vec::new();
+    }
+    let mut out: Vec<IpAddr> = std::fs::read_to_string("/tmp/resolv.conf.d/resolv.conf.auto")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("nameserver")?.trim().parse().ok())
+        .collect();
+    for line in dnsmasq_settings().unwrap_or_default() {
+        // server=<address>[#port]; server=/<domain>/... only serves its domains.
+        if let Some(server) = line.strip_prefix("server=")
+            && let Ok(ip) = server.split('#').next().unwrap_or_default().parse()
+        {
+            out.push(ip);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn dnsmasq(forwarder: SocketAddr) -> Result<DnsRestore> {
+    let dirs = dnsmasq_dirs()?;
+    ensure!(
+        !dirs.is_empty(),
+        "no running dnsmasq instance with a conf-dir; set dns.set_system to false to configure DNS manually"
+    );
+    let text = format!(
+        "# edup-client: every name through its DNS forwarder\nno-resolv\nserver={}#{}\n",
+        forwarder.ip(),
+        forwarder.port()
+    );
+    let mut restore = DnsRestore { files: Vec::new() };
+    for dir in dirs {
+        let file = dir.join(DNSMASQ_FILE);
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&file, &text))
+            .with_context(|| format!("write {}", file.display()))?;
+        restore.files.push(file);
+    }
+    // A restart also empties dnsmasq's cache.
+    restart_dnsmasq().context("set dns.set_system to false to configure DNS manually")?;
+    Ok(restore)
+}
+
+fn restart_dnsmasq() -> Result<()> {
+    let out = Command::new("/etc/init.d/dnsmasq")
+        .arg("restart")
+        .output()
+        .context("run /etc/init.d/dnsmasq")?;
+    ensure!(
+        out.status.success(),
+        "/etc/init.d/dnsmasq restart: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     Ok(())
 }
 pub fn ensure_available(name: &str) -> Result<()> {

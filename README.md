@@ -38,6 +38,10 @@ when the network path is untrusted.
 - **Multiple users:** random signed 64-bit user IDs, individual passwords, automatic
   endpoint learning, and periodic KEEPALIVE. Clients choose their local TUN
   addresses independently; different users may use identical addresses.
+- **Router mode:** on a Linux or OpenWrt router in XDP mode, a permanent eBPF
+  client table sends each LAN device's traffic always, never, or by the routing
+  rules through the tunnel; a LuCI app manages devices and rules. See
+  [Router (OpenWrt)](#router-openwrt).
 - **Client routing rules:** proxy or bypass by CIDR, domain or sing-box `.srs`
   rule-sets (GeoIP and geosite), first match wins, with a default for everything else.
   Routes are installed for the selected address family and removed on graceful
@@ -185,6 +189,13 @@ destinations `"to": "proxy"` or `"to": "bypass"`:
 - `"domain_keyword"`: a substring of the name.
 - `"rules"`: a sing-box binary rule-set (`.srs`, versions 1-5): an
   `http://`/`https://` URL or a file path relative to the configuration.
+- `"from"` (XDP mode only): source addresses or networks, such as LAN
+  devices of a router. Such a rule has no destination items and sends the
+  sources' traffic `"to": "proxy"` (everything through the tunnel),
+  `"bypass"` (nothing) or `"rules"` (the destination rules decide). `from`
+  rules come before all destination rules; the first one containing a source
+  decides. Sources no `from` rule contains, including the host itself, follow
+  the destination rules. See [Router (OpenWrt)](#router-openwrt).
 
 Each field takes one value or an array, and an entry may combine fields; it
 matches when any of them does. Rules are ordered: the first entry matching a
@@ -203,13 +214,16 @@ and used when a later download fails.
 #### Domain rules and DNS
 
 Routes see addresses, not names. When any rule contains names, the client runs
-a DNS forwarder on its tunnel address, port 53 (UDP and TCP), and points the
+a DNS forwarder on its tunnel address, port `dns.port` (default 53; UDP and TCP), and points the
 system resolver at it through the TUN interface: systemd-resolved on Linux
 (`resolvectl`, routing domain `~.`), and the adapter's DNS server and interface
 metric on Windows. These settings disappear with the interface, even if the
 client crashes. Queries go to `dns.servers` (default `1.1.1.1` and `8.8.8.8`,
 or Cloudflare and Google IPv6 resolvers in IPv6 mode), which are routed like
-any other destination. Before an answer reaches the application, each of its
+any other destination. With `"proxy": true` they always use the tunnel,
+ahead of every rule; resolvers on private, shared (100.64.0.0/10) or
+link-local addresses stay direct. Other traffic to those addresses then uses
+the tunnel too. Before an answer reaches the application, each of its
 addresses for a matched name gets a host route through the tunnel or the
 default route, unless the static routes already send it that way, so the first
 connection already follows the rule. Host routes stay until the client stops.
@@ -222,7 +236,7 @@ connection already follows the rule. Host routes stay until the client stops.
     { "rules": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ru.srs", "to": "bypass" }
   ]
 },
-"dns": { "servers": ["1.1.1.1", "8.8.8.8"], "set_system": true }
+"dns": { "servers": ["1.1.1.1", "8.8.8.8"], "set_system": true, "proxy": false }
 ```
 
 Name-based routing is only as complete as the DNS traffic the forwarder sees:
@@ -237,7 +251,9 @@ Name-based routing is only as complete as the DNS traffic the forwarder sees:
 - On Windows, other adapters' resolvers may still be asked in parallel.
 
 With `"set_system": false` the forwarder runs without changing system DNS;
-send queries to `<tunnel address>:53` yourself.
+send queries to `<tunnel address>:<dns.port>` yourself. Another port avoids a
+DNS server that binds port 53 on every address; systemd-resolved (246 and
+newer) and dnsmasq take one, the Windows adapter setting needs 53.
 
 The client turns the rules into the fewest routes: proxied prefixes via TUN,
 or a `/1` via TUN with bypassed prefixes via the system's preferred default
@@ -266,6 +282,15 @@ of the route to the server carry the tunnel and route each destination:
   destination stay in the kernel.
 - An XDP program on the same interface decapsulates the server's packets and
   passes them to the local stack as ordinary packets for the interface address.
+  Interfaces without Ethernet headers, such as PPPoE (`pppoe-wan`), use TC
+  programs for both directions instead; `xdp_mode` then does not apply.
+- With `from` rules, a TC program on each LAN interface whose network
+  contains a listed source looks it up in a permanent client table and records
+  the device's mode in the top byte of the packet mark, which survives
+  forwarding and masquerading. Proxied and bypassed devices need no route
+  lookups; for devices following the rules, unknown destinations are looked up
+  on the LAN interface, before routing, so the client re-sends the packet as
+  it arrived.
 - Packets follow the standard route, the one the system uses without edup,
   whenever the client fails to respond: while its heartbeat is older than 2
   seconds (the client is stopped, hung or killed), and when a lookup stays
@@ -289,7 +314,8 @@ rejected in this mode.
 ```
 
 Requirements and limitations:
-- Linux 5.10 or newer, root, and an Ethernet or Wi-Fi interface. Linux 6.6
+- Linux 5.10 or newer, root, the `veth` module, and an Ethernet, Wi-Fi or
+  PPP interface. Linux 6.6
   and newer attach the TC programs as links (TCX) that disappear with the
   client. Older kernels use a `clsact` qdisc; programs left there by a crash
   only pass traffic to the standard route and are replaced at the next start.
@@ -308,11 +334,90 @@ Requirements and limitations:
   destinations are dropped, not fragmented.
 - As in TUN mode, existing connections to proxied destinations move into the
   tunnel when the client starts.
-- Generic XDP (`"skb"`) runs after GRO: keep `rx-gro-list` disabled on the
-  interface (the default), or tunnel packets may arrive coalesced.
+- Generic XDP (`"skb"`) and the TC decapsulation of PPP interfaces run after
+  GRO, which can merge tunnel datagrams that then miss decapsulation. The
+  client turns UDP GRO (`rx-gro-list`, `rx-udp-gro-forwarding`, which OpenWrt
+  enables) off on the interface and the devices below it while it runs, and
+  back on at exit; after a crash it stays off until a reboot.
+- On interfaces without a link-layer header (PPP), decapsulated packets
+  return through the veth pair, arriving on `<interface>s`: its GRO merges
+  inner TCP segments, which the stack then forwards as one packet, and its
+  packet steering spreads inner flows over all CPUs. Firewall rules that
+  match the input interface see `<interface>s`; established connections are
+  unaffected. Strict reverse path filtering (`net.ipv4.conf.all.rp_filter=1`)
+  keeps the direct path.
+- All tunnel packets are one flow, so one CPU receives and decapsulates them.
+  When packet steering (`rps_cpus`, as set by OpenWrt's packet steering)
+  sends the devices below a PPP interface to some CPUs, the client steers
+  the PPP interface to the others while it runs, splitting that work.
 
 At shutdown, and every 5 seconds with `EDUP_DIAGNOSTICS` set, the client prints
 lookup and `xdp_*` packet counters.
+
+### Router (OpenWrt)
+
+In XDP mode on a router, `from` rules choose per LAN device:
+
+```jsonc
+"routing": {
+  "default_route": "proxy",
+  "routes": [
+    { "from": "192.168.1.50", "to": "proxy" },        // always through the tunnel
+    { "from": ["192.168.1.60", "192.168.1.61"], "to": "bypass" }, // never
+    { "from": "192.168.1.70", "to": "rules" },        // the rules below decide
+    { "from": "192.168.1.0/24", "to": "bypass" },     // other LAN devices
+    { "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"], "to": "bypass" },
+    { "rules": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs", "to": "bypass" }
+  ]
+}
+```
+
+The tunnel carries one local address, so LAN traffic must be masqueraded on
+the WAN interface, as OpenWrt's `wan` zone does by default. SIGHUP reloads the
+`from` rules without a restart; other changes need one. Changing a device's mode
+breaks its open connections that move to another path.
+
+Requirements and limitations:
+- Flow offloading (software or hardware) must be off: offloaded connections
+  bypass the egress hook. The client warns when an nftables flowtable exists.
+- No other program may set the top byte of packet marks to 1, 2 or 3.
+- LAN IPv6 needs NAT66 (`masq6`); otherwise those devices keep the standard route.
+- With domain rules, the client points dnsmasq at its DNS forwarder while it
+  runs (`edup.conf` in dnsmasq's `conf-dir`) and restores it at exit. After a
+  crash, the next start, or stopping the service, removes the leftover file.
+  dnsmasq binds port 53 on every new address, the tunnel's included, so the
+  package runs the forwarder on port 10053 (uci `dns_port`).
+- The router's own DNS queries follow the rules like its other traffic. ISP
+  resolvers often refuse queries arriving from the tunnel server's address; the
+  client warns when dnsmasq's upstream servers would be proxied. Add a bypass
+  rule for them or use public resolvers.
+
+#### OpenWrt packages
+
+OpenWrt 25.12 and newer on aarch64 (tested on mediatek/filogic). Build a static
+executable with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild),
+zig 0.15.2 and the eBPF toolchain above; with an OpenWrt SDK, also the
+`edup-client` and `luci-app-edup` apk packages:
+
+```sh
+rustup target add --toolchain stable aarch64-unknown-linux-musl
+cargo install --locked cargo-zigbuild
+SDK=~/openwrt/openwrt-sdk-25.12.2-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64 sh scripts/build-openwrt.sh
+```
+
+Output: `dist/openwrt/`. The CI job `openwrt` builds the same archive. Install
+on the router (the packages are unsigned):
+
+```sh
+apk add --allow-untrusted edup-client-0.1.0-r1.apk luci-app-edup-0.1.0-r1.apk
+```
+
+Then use **Services → edup VPN** in LuCI: per-device modes on *Devices*,
+destination rules on *Traffic rules*, and server, credentials and status on
+*Settings*. The settings live in `/etc/config/edup`; the service writes
+`/var/etc/edup/client.json` from them. Device changes apply through SIGHUP,
+others restart the service, as does a WAN reconnect (`wan_interface`), since
+PPPoE may assign a new address. For PPPoE (MTU 1492) set `mtu` to 1465.
 
 ### IPv6
 

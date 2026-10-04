@@ -29,10 +29,13 @@
       { "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"], "to": "bypass" }
       // sing-box binary rule-sets (.srs): http(s) URL or path relative to this file.
       // { "rules": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs", "to": "bypass" }
+      // XDP mode on a router: LAN devices, before all other rules; "to" is
+      // "proxy", "bypass" or "rules" (the destination rules decide).
+      // { "from": "192.168.1.50", "to": "proxy" },
       // Domain rules start a DNS forwarder; ".ru" matches subdomains of ru.
       // { "domain": "example.com", "domain_suffix": [".ru", ".example.com"], "to": "bypass" }
     ]
   }
   // Used only with domain rules. Upstream resolvers are routed like other traffic.
-  // "dns": { "servers": ["1.1.1.1", "8.8.8.8"], "set_system": true }
+  // "dns": { "servers": ["1.1.1.1", "8.8.8.8"], "set_system": true, "proxy": false }
 }

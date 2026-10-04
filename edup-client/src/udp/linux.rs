@@ -63,7 +63,8 @@ pub fn send_segmented(socket: &UdpSocket, data: &[u8], segment: u16) -> io::Resu
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = len;
+    // size_t in glibc, socklen_t in musl.
+    msg.msg_controllen = len as _;
     // SAFETY: all msg pointers refer to live buffers for this synchronous call.
     let n = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, 0) };
     if n < 0 {
@@ -87,7 +88,7 @@ pub fn recv(
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.capacity();
+    msg.msg_controllen = control.capacity() as _;
     let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());
@@ -97,6 +98,6 @@ pub fn recv(
     }
     Ok((
         n as usize,
-        control.segment(msg.msg_controllen, libc::IPPROTO_UDP, libc::UDP_GRO)?,
+        control.segment(msg.msg_controllen as _, libc::IPPROTO_UDP, libc::UDP_GRO)?,
     ))
 }

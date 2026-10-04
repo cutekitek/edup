@@ -24,10 +24,9 @@ pub struct Listener {
     tcp: TcpListener,
 }
 impl Listener {
-    /// Binds port 53 on the tunnel address. Windows may need a moment before
-    /// a new adapter address becomes usable.
-    pub fn bind(address: IpAddr) -> Result<Self> {
-        let at = SocketAddr::new(address, 53);
+    /// Binds the forwarder's port on the tunnel address. Windows may need a
+    /// moment before a new adapter address becomes usable.
+    pub fn bind(at: SocketAddr) -> Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match UdpSocket::bind(at).and_then(|udp| Ok((udp, TcpListener::bind(at)?))) {
@@ -40,6 +39,11 @@ impl Listener {
                     if e.kind() == io::ErrorKind::AddrNotAvailable && Instant::now() < deadline =>
                 {
                     thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                    return Err(e).with_context(|| {
+                        format!("bind DNS forwarder on {at}; another DNS server uses it, choose another dns.port")
+                    });
                 }
                 Err(e) => return Err(e).with_context(|| format!("bind DNS forwarder on {at}")),
             }

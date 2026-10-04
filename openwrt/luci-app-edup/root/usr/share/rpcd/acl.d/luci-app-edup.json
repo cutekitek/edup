@@ -1,0 +1,22 @@
+{
+	"luci-app-edup": {
+		"description": "Grant access to the edup VPN configuration",
+		"read": {
+			"file": {
+				"/sbin/logread": [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec" ],
+				"luci-rpc": [ "getHostHints" ],
+				"service": [ "list" ]
+			},
+			"uci": [ "edup" ]
+		},
+		"write": {
+			"ubus": {
+				"rc": [ "init" ]
+			},
+			"uci": [ "edup" ]
+		}
+	}
+}

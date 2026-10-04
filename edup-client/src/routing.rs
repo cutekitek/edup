@@ -1,7 +1,8 @@
 //! Turns `routing` rules into system routes for the tunnel's address family:
 //! static routes for addresses, host routes for DNS answers of matched names.
+//! `from` rules form the client table of XDP mode instead.
 use crate::{
-    config::{Action, Settings},
+    config::{Action, Settings, Target},
     domain::DomainMatcher,
     ipset::{Family, IpSet, Prefix, key},
     ruleset,
@@ -75,6 +76,9 @@ pub fn resolve(cfg: &Settings) -> Result<Rules> {
     let mut loaded: HashMap<&str, (IpSet, DomainMatcher)> = HashMap::new();
     let mut rules = Vec::new();
     for (i, rule) in cfg.routing.routes.iter().enumerate() {
+        if rule.is_client() {
+            continue;
+        }
         let mut set = IpSet::from_ranges(
             rule.ip
                 .iter()
@@ -103,14 +107,115 @@ pub fn resolve(cfg: &Settings) -> Result<Rules> {
         rules.push(Rule {
             ip: set,
             domains,
-            action: rule.to,
+            action: rule.action(),
         });
+    }
+    // Ahead of every rule; the forwarder runs only for domain rules.
+    if cfg.dns.proxy && rules.iter().any(|r| !r.domains.is_empty()) {
+        let ip = IpSet::from_ranges(
+            cfg.dns_servers()
+                .iter()
+                .map(|s| s.ip())
+                .filter(|&ip| Family::of(ip) == family && public(ip))
+                .map(|ip| Prefix::host(ip).range())
+                .collect(),
+        );
+        rules.insert(
+            0,
+            Rule {
+                ip,
+                domains: DomainMatcher::default(),
+                action: Action::Proxy,
+            },
+        );
     }
     Ok(Rules {
         rules,
         default: cfg.routing.default_route,
         server: cfg.server.ip(),
     })
+}
+
+/// Not a private, loopback or link-local address: a resolver on the local
+/// network stays reachable only directly.
+fn public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let shared = ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64;
+            !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || shared)
+        }
+        IpAddr::V6(ip) => {
+            let segment = ip.segments()[0];
+            !(ip.is_loopback() || segment & 0xfe00 == 0xfc00 || segment & 0xffc0 == 0xfe80)
+        }
+    }
+}
+
+/// The `from` rules of the tunnel's family flattened into disjoint source
+/// sets, first match first. Sources in neither set follow the destination rules.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Clients {
+    pub proxy: IpSet,
+    pub bypass: IpSet,
+    /// Every source any `from` rule names, whatever its target.
+    pub listed: IpSet,
+}
+#[cfg_attr(not(all(target_os = "linux", feature = "xdp")), allow(dead_code))]
+impl Clients {
+    pub fn is_empty(&self) -> bool {
+        self.listed.is_empty()
+    }
+    /// The target the client table gives `ip`.
+    pub fn target(&self, ip: IpAddr) -> Target {
+        let address = key(ip);
+        if self.proxy.contains(address) {
+            Target::Proxy
+        } else if self.bypass.contains(address) {
+            Target::Bypass
+        } else {
+            Target::Rules
+        }
+    }
+    /// Disjoint prefixes with their target; `rules` sources have none.
+    pub fn entries(&self, family: Family) -> Vec<(Prefix, Target)> {
+        let mut out: Vec<_> = self
+            .proxy
+            .prefixes(family)
+            .into_iter()
+            .map(|p| (p, Target::Proxy))
+            .collect();
+        out.extend(
+            self.bypass
+                .prefixes(family)
+                .into_iter()
+                .map(|p| (p, Target::Bypass)),
+        );
+        out
+    }
+}
+
+pub fn clients(cfg: &Settings) -> Clients {
+    let family = Family::of(cfg.server.ip());
+    let mut remaining = IpSet::full(family);
+    let mut clients = Clients::default();
+    for rule in cfg.routing.routes.iter().filter(|r| r.is_client()) {
+        let set = IpSet::from_ranges(
+            rule.from
+                .iter()
+                .filter(|p| p.family() == family)
+                .map(Prefix::range)
+                .collect(),
+        );
+        let matched = set.intersection(&remaining);
+        match rule.to {
+            Target::Proxy => clients.proxy = clients.proxy.union(&matched),
+            Target::Bypass => clients.bypass = clients.bypass.union(&matched),
+            Target::Rules => {}
+        }
+        remaining = remaining.difference(&set, family);
+        clients.listed = clients.listed.union(&set);
+    }
+    clients
 }
 
 pub fn plan(server: IpAddr, default: Action, rules: &[Rule]) -> Plan {
@@ -304,6 +409,58 @@ mod tests {
     }
 
     #[test]
+    fn client_rules_flatten_first_match_first() {
+        let cfg: Settings = edup_common::json::parse(
+            r#"{"mode": "xdp", "server": "192.0.2.1:7777", "user": 1, "password": "test",
+            "routing": {"routes": [
+                {"from": "192.168.1.50", "to": "bypass"},
+                {"from": ["192.168.1.60", "192.168.1.61"], "to": "proxy"},
+                {"from": ["192.168.1.70", "2001:db8::/64"], "to": "rules"},
+                {"from": "192.168.1.0/24", "to": "bypass"},
+                {"from": "192.168.1.0/25", "to": "proxy"},
+                {"ip": "10.0.0.0/8", "to": "bypass"}
+            ]}}"#,
+        )
+        .unwrap();
+        let clients = clients(&cfg);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for (address, target) in [
+            ("192.168.1.50", Target::Bypass),
+            ("192.168.1.60", Target::Proxy),
+            ("192.168.1.61", Target::Proxy),
+            ("192.168.1.70", Target::Rules),
+            ("192.168.1.10", Target::Bypass),
+            ("192.168.1.200", Target::Bypass),
+            ("192.168.2.1", Target::Rules),
+            ("192.0.2.1", Target::Rules),
+        ] {
+            assert_eq!(clients.target(ip(address)), target, "{address}");
+        }
+        assert_eq!(
+            text(&clients.proxy.prefixes(Family::V4)),
+            ["192.168.1.60/31"]
+        );
+        assert!(clients.listed.contains(key(ip("192.168.1.70"))));
+        let entries = clients.entries(Family::V4);
+        assert!(entries.iter().all(|(p, _)| p.family() == Family::V4));
+        assert!(
+            !entries
+                .iter()
+                .any(|(p, _)| p.range().0 <= key(ip("192.168.1.70"))
+                    && key(ip("192.168.1.70")) <= p.range().1)
+        );
+        // Destination rules ignore the client table.
+        let rules = resolve(&cfg).unwrap();
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.address_action(ip("10.1.1.1")), Action::Bypass);
+        assert!(super::clients(&parse_default()).is_empty());
+    }
+    fn parse_default() -> Settings {
+        edup_common::json::parse(r#"{"server": "192.0.2.1:7777", "user": 1, "password": "test"}"#)
+            .unwrap()
+    }
+
+    #[test]
     fn address_action_follows_the_first_matching_rule() {
         let rules = Rules {
             rules: rules(&[
@@ -317,5 +474,49 @@ mod tests {
         assert_eq!(rules.address_action(ip("10.1.2.3")), Action::Bypass);
         assert_eq!(rules.address_action(ip("10.2.0.1")), Action::Proxy);
         assert_eq!(rules.address_action(ip("11.0.0.1")), Action::Bypass);
+    }
+
+    #[test]
+    fn dns_proxy_sends_public_resolvers_through_the_tunnel() {
+        let settings = |dns: &str, routes: &str| -> Settings {
+            edup_common::json::parse(&format!(
+                r#"{{"server": "192.0.2.1:7777", "user": 1, "password": "test",
+                "routing": {{"default_route": "bypass", "routes": [{routes}]}}, "dns": {dns}}}"#
+            ))
+            .unwrap()
+        };
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let routes =
+            r#"{"ip": "0.0.0.0/0", "to": "bypass"}, {"domain_suffix": ".ru", "to": "bypass"}"#;
+        let servers = r#""servers": ["9.9.9.9", "192.168.1.10", "100.64.0.53", "2620:fe::fe"]"#;
+        let rules = resolve(&settings(
+            &format!("{{{servers}, \"proxy\": true}}"),
+            routes,
+        ))
+        .unwrap();
+        assert_eq!(rules.address_action(ip("9.9.9.9")), Action::Proxy);
+        // Local resolvers stay direct, as does everything else.
+        for address in ["192.168.1.10", "100.64.0.53", "8.8.8.8"] {
+            assert_eq!(
+                rules.address_action(ip(address)),
+                Action::Bypass,
+                "{address}"
+            );
+        }
+        // Default upstreams.
+        let rules = resolve(&settings(r#"{"proxy": true}"#, routes)).unwrap();
+        assert_eq!(rules.address_action(ip("1.1.1.1")), Action::Proxy);
+        assert_eq!(rules.address_action(ip("8.8.8.8")), Action::Proxy);
+        // Off, or without domain rules (no forwarder): the rules decide.
+        for (dns, routes) in [
+            (format!("{{{servers}}}"), routes),
+            (
+                format!("{{{servers}, \"proxy\": true}}"),
+                r#"{"ip": "9.0.0.0/8", "to": "bypass"}"#,
+            ),
+        ] {
+            let rules = resolve(&settings(&dns, routes)).unwrap();
+            assert_eq!(rules.address_action(ip("9.9.9.9")), Action::Bypass, "{dns}");
+        }
     }
 }

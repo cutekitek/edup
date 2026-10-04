@@ -486,8 +486,35 @@ fn echo_peer() {
             ip(&["addr", "add", address, "dev", dev]);
         }
     }
+    // A GRE link: a client interface without a link-layer header.
+    let gre = std::env::var("EDUP_PEER_GRE").as_deref() == Ok("1");
+    if gre {
+        ip(&[
+            "link",
+            "add",
+            "edup-gre0",
+            "type",
+            "gre",
+            "local",
+            "192.0.2.1",
+            "remote",
+            "192.0.2.2",
+        ]);
+        ip(&[
+            "addr",
+            "add",
+            "198.18.0.1",
+            "peer",
+            "198.18.0.2",
+            "dev",
+            "edup-gre0",
+        ]);
+        ip(&["link", "set", "edup-gre0", "up"]);
+    }
     let socket = UdpSocket::bind(if ipv6 {
         "[2001:db8:1::1]:7777"
+    } else if gre {
+        "198.18.0.1:7777"
     } else {
         "192.0.2.1:7777"
     })
@@ -1031,6 +1058,206 @@ fn isolated_xdp(ipv6: bool) {
     fs::write(dir.join("stop"), "").unwrap();
     drop(_peer);
     println!("XDP tunnel, route lookups, bypass, fallback, crash recovery and cleanup passed");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(feature = "xdp")]
+#[test]
+#[ignore = "requires root, iproute2, nft, ping, unshare, /dev/net/tun and eBPF; isolated namespaces"]
+fn isolated_xdp_router() {
+    const TEST: &str = "isolated_xdp_router";
+    if std::env::var_os("EDUP_CLIENT_NS").is_none() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+        let status = Command::new("unshare")
+            .args(["--mount", "--net"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", TEST, "--nocapture"])
+            .env("EDUP_CLIENT_NS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    checked("mount", &["--make-rprivate", "/"]);
+    checked("mount", &["-t", "sysfs", "sysfs", "/sys"]);
+    checked("mount", &["-t", "tmpfs", "tmpfs", "/run"]);
+    let dir = std::env::temp_dir().join(format!("edup-router-test-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    // A router: LAN clients behind masquerading, and a WAN interface without
+    // a link-layer header (GRE here, PPPoE in practice).
+    let rules = r#"[
+      { "from": "192.168.77.2", "to": "proxy" },
+      { "from": "192.168.77.3", "to": "bypass" },
+      { "from": "192.168.77.0/24", "to": "rules" },
+      { "ip": "10.0.0.0/8", "to": "bypass" }
+    ]"#;
+    let config = |rules: &str| {
+        format!(
+            r#"{{"mode": "xdp", "server": "198.18.0.1:7777", "user": 4829017365182049271,
+            "password": "replace-this-password", "tunnel_ip": "10.66.0.7", "mtu": 1400,
+            "keepalive_secs": 1, "routing": {{"default_route": "proxy", "routes": {rules}}}}}"#
+        )
+    };
+    fs::write(dir.join("client.json"), config(rules)).unwrap();
+    ip(&["link", "set", "lo", "up"]);
+    ip(&[
+        "link",
+        "add",
+        "edup-test0",
+        "type",
+        "veth",
+        "peer",
+        "name",
+        "edup-peer0",
+    ]);
+    let peer_addresses = "10.1.2.3/32 10.1.2.4/32 10.1.2.5/32 203.0.113.78/32";
+    let _peer = Process(
+        Command::new("unshare")
+            .arg("--net")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "echo_peer", "--nocapture"])
+            .env("EDUP_PEER_DIR", &dir)
+            .env("EDUP_PEER_IPV6", "0")
+            .env("EDUP_PEER_ADDRESSES", peer_addresses)
+            .env("EDUP_PEER_GSO", "0")
+            .env("EDUP_PEER_GRE", "1")
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(|| dir.join("peer-pid").exists());
+    let pid = fs::read_to_string(dir.join("peer-pid")).unwrap();
+    ip(&["link", "set", "edup-peer0", "netns", &pid]);
+    ip(&["addr", "add", "192.0.2.2/24", "dev", "edup-test0"]);
+    ip(&["link", "set", "edup-test0", "up"]);
+    ip(&[
+        "link",
+        "add",
+        "edup-wan0",
+        "type",
+        "gre",
+        "local",
+        "192.0.2.2",
+        "remote",
+        "192.0.2.1",
+    ]);
+    ip(&[
+        "addr",
+        "add",
+        "198.18.0.2",
+        "peer",
+        "198.18.0.1",
+        "dev",
+        "edup-wan0",
+    ]);
+    ip(&["link", "set", "edup-wan0", "up"]);
+    ip(&["route", "add", "default", "dev", "edup-wan0"]);
+    // The LAN host owns one address per client mode.
+    ip(&["netns", "add", "edup-lanhost"]);
+    ip(&[
+        "link",
+        "add",
+        "edup-lan0",
+        "type",
+        "veth",
+        "peer",
+        "name",
+        "edup-lan1",
+        "netns",
+        "edup-lanhost",
+    ]);
+    ip(&["addr", "add", "192.168.77.1/24", "dev", "edup-lan0"]);
+    ip(&["link", "set", "edup-lan0", "up"]);
+    let lan = |args: &[&str]| {
+        let mut all = vec!["netns", "exec", "edup-lanhost"];
+        all.extend(args);
+        checked("ip", &all)
+    };
+    lan(&["ip", "link", "set", "lo", "up"]);
+    for address in ["192.168.77.2/24", "192.168.77.3/24", "192.168.77.4/24"] {
+        lan(&["ip", "addr", "add", address, "dev", "edup-lan1"]);
+    }
+    lan(&["ip", "link", "set", "edup-lan1", "up"]);
+    lan(&["ip", "route", "add", "default", "via", "192.168.77.1"]);
+    fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+    checked(
+        "nft",
+        &[
+            "add table ip nat; add chain ip nat post { type nat hook postrouting priority srcnat; }; add rule ip nat post oifname edup-wan0 masquerade",
+        ],
+    );
+    wait_for(|| dir.join("peer-ready").exists());
+    let tunnelled = |address: &str| {
+        fs::read_to_string(dir.join("tunnelled"))
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l == address)
+    };
+    let ping = |address: &str| checked("ping", &["-n", "-c", "2", "-W", "3", address]);
+    let lan_ping = |source: &str, address: &str| {
+        lan(&["ping", "-n", "-c", "2", "-W", "3", "-I", source, address])
+    };
+
+    let mut router = client(&dir);
+    started(&dir, &mut router);
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    assert!(log.contains("(TC on edup-wan0"), "{log}");
+    assert!(log.contains("clients: 2 prefixes on edup-lan0"), "{log}");
+    // The router's own traffic follows the destination rules.
+    ping("203.0.113.9");
+    assert!(tunnelled("203.0.113.9"));
+    ping("10.1.2.3");
+    assert!(!tunnelled("10.1.2.3"));
+    // A proxied client: everything through the tunnel, rules or not.
+    lan_ping("192.168.77.2", "10.1.2.4");
+    assert!(tunnelled("10.1.2.4"));
+    // A bypassed client never uses the tunnel.
+    lan_ping("192.168.77.3", "203.0.113.78");
+    assert!(!tunnelled("203.0.113.78"));
+    // A "rules" client: looked up before masquerading.
+    lan_ping("192.168.77.4", "10.1.2.5");
+    assert!(!tunnelled("10.1.2.5"));
+    lan_ping("192.168.77.4", "203.0.113.80");
+    assert!(tunnelled("203.0.113.80"));
+    // UDP of a "rules" client: the first datagram is re-injected unchanged.
+    let echo = lan(&[
+        "bash",
+        "-c",
+        "exec 3<>/dev/udp/203.0.113.81/9000; printf routed >&3; timeout 3 head -c 6 <&3",
+    ]);
+    assert_eq!(echo, "routed");
+    assert!(tunnelled("203.0.113.81"));
+
+    // SIGHUP applies a changed client table without a restart.
+    fs::write(
+        dir.join("client.json"),
+        config(&rules.replace(
+            r#"{ "from": "192.168.77.3", "to": "bypass" }"#,
+            r#"{ "from": "192.168.77.3", "to": "proxy" }"#,
+        )),
+    )
+    .unwrap();
+    assert_eq!(unsafe { libc::kill(router.0.id() as i32, libc::SIGHUP) }, 0);
+    wait_for(|| {
+        fs::read_to_string(dir.join("client.log"))
+            .unwrap()
+            .contains("edup client reloaded")
+    });
+    lan_ping("192.168.77.3", "203.0.113.79");
+    assert!(tunnelled("203.0.113.79"));
+    lan_ping("192.168.77.2", "10.1.2.3");
+    stop(&mut router);
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    assert!(!log.contains("restart edup-client"), "{log}");
+    assert!(!log.contains("reload failed"), "{log}");
+    for name in ["edup0", "edup0s", "edup0e"] {
+        assert!(!Path::new("/sys/class/net").join(name).exists(), "{name}");
+    }
+    // Without the client, every client takes the standard route again.
+    lan_ping("192.168.77.2", "203.0.113.78");
+
+    fs::write(dir.join("stop"), "").unwrap();
+    drop(_peer);
+    println!("router clients, live reload and a link without Ethernet headers passed");
     fs::remove_dir_all(&dir).unwrap();
 }
 

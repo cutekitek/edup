@@ -108,6 +108,7 @@ fn frame(ip: &[u8]) -> Vec<u8> {
 
 fn load(v6: bool) -> Ebpf {
     let mut bpf = Ebpf::load(OBJECT).unwrap();
+    set_keystream(&mut bpf, &KEY).unwrap();
     let mut config = ClientConfig {
         key0: KEY.k0,
         key1: KEY.k1,
@@ -134,11 +135,20 @@ fn load(v6: bool) -> Ebpf {
         .set(0, Config(config), 0)
         .unwrap();
     let family = if v6 { 6 } else { 4 };
+    // The verifier accepts the variants for interfaces without a link-layer
+    // header too; BPF_PROG_TEST_RUN always passes Ethernet frames.
     for name in [
         format!("edup_egress{family}"),
         format!("edup_encap{family}"),
+        format!("edup_classify{family}"),
+        format!("edup_egress{family}_l3"),
+        format!("edup_classify{family}_l3"),
+        format!("edup_decap{family}_l3"),
     ] {
-        classifier(&mut bpf, &name).unwrap().load().unwrap();
+        classifier(&mut bpf, &name)
+            .unwrap()
+            .load()
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
     }
     xdp(&mut bpf, &format!("edup_ingress{family}"))
         .unwrap()
@@ -147,15 +157,23 @@ fn load(v6: bool) -> Ebpf {
     bpf
 }
 fn run(bpf: &Ebpf, name: &str, input: &[u8], mark: u32) -> (u32, Vec<u8>) {
+    let (code, out, _) = run_marked(bpf, name, input, mark);
+    (code, out)
+}
+/// Also returns the mark the program leaves.
+fn run_marked(bpf: &Ebpf, name: &str, input: &[u8], mark: u32) -> (u32, Vec<u8>, u32) {
     let mut out = vec![0; 4096];
     // struct __sk_buff starts with len, pkt_type and mark.
     let mut ctx = [0u8; 12];
     ctx[8..].copy_from_slice(&mark.to_ne_bytes());
+    // The kernel writes back the whole struct __sk_buff.
+    let mut ctx_out = [0u8; 256];
     let result = match bpf.program(name).unwrap() {
         Program::SchedClassifier(p) => p.test_run(TestRunOptions {
             data_in: Some(input),
             data_out: Some(&mut out),
             ctx_in: Some(&ctx),
+            ctx_out: Some(&mut ctx_out),
             ..Default::default()
         }),
         Program::Xdp(p) => p.test_run(TestRunOptions {
@@ -167,7 +185,8 @@ fn run(bpf: &Ebpf, name: &str, input: &[u8], mark: u32) -> (u32, Vec<u8>) {
     }
     .unwrap();
     out.truncate(result.data_size_out as usize);
-    (result.return_value, out)
+    let mark = u32::from_ne_bytes(ctx_out[8..12].try_into().unwrap());
+    (result.return_value, out, mark)
 }
 fn sealed(inner: &[u8], to_server: bool) -> Vec<u8> {
     let mut data = vec![0; wire::HDR_LEN];
@@ -386,4 +405,261 @@ fn egress_asks_userspace_once_and_falls_back() {
     assert_eq!(count(client_stat::LOOKUP), 3);
     assert_eq!(count(client_stat::PROXY), 2);
     assert_eq!(count(client_stat::BYPASS), 1);
+}
+
+fn insert_prefix(bpf: &mut Ebpf, map: &str, prefix: &str, value: u32) {
+    let prefix: Prefix = prefix.parse().unwrap();
+    lpm_trie::LpmTrie::<_, [u8; 16], u32>::try_from(bpf.map_mut(map).unwrap())
+        .unwrap()
+        .insert(
+            &{
+                let (len, data) = entry(&prefix);
+                lpm_trie::Key::new(len.into(), data)
+            },
+            value,
+            0,
+        )
+        .unwrap();
+}
+fn mode_mark(mode: u8) -> u32 {
+    u32::from(mode) << edup_common::maps::MODE_SHIFT
+}
+
+#[test]
+#[ignore = "requires root; loads eBPF programs into the kernel"]
+fn classifier_marks_client_modes() {
+    for v6 in [false, true] {
+        let mut bpf = load(v6);
+        let (name, client, proxied, bypassed, other) = if v6 {
+            (
+                "edup_classify6",
+                "fd00:1::/64",
+                "fd00:1::60",
+                "fd00:1::50",
+                "fd00:2::1",
+            )
+        } else {
+            (
+                "edup_classify4",
+                "192.168.1.0/24",
+                "192.168.1.60",
+                "192.168.1.50",
+                "192.168.2.1",
+            )
+        };
+        insert_prefix(&mut bpf, "CLIENTS", client, MODE_BYPASS.into());
+        insert_prefix(&mut bpf, "CLIENTS", proxied, MODE_PROXY.into());
+        let remote: &[u8] = if v6 { &REMOTE6 } else { &REMOTE };
+        let packet = |src: &str| {
+            let src = octets(src.parse().unwrap());
+            frame(&ip(&src, remote, 17, udp(1, 2, &[0; 8])))
+        };
+        for (src, mode) in [
+            (proxied, MODE_PROXY),
+            (bypassed, MODE_BYPASS),
+            (other, MODE_RULES),
+        ] {
+            // Other mark bits stay; an earlier mode byte is replaced.
+            for before in [0, 0x1234, mode_mark(MODE_PROXY) | 0x10] {
+                let (code, out, mark) = run_marked(&bpf, name, &packet(src), before);
+                assert_eq!(code, UNSPEC);
+                assert_eq!(out, packet(src));
+                assert_eq!(mark, before & 0xff_ffff | mode_mark(mode), "{src}");
+            }
+        }
+        // Another family is left alone.
+        let other_family = if v6 {
+            frame(&ip(&LOCAL, &REMOTE, 17, udp(1, 2, &[0; 8])))
+        } else {
+            frame(&ip(&LOCAL6, &REMOTE6, 17, udp(1, 2, &[0; 8])))
+        };
+        assert_eq!(run_marked(&bpf, name, &other_family, 7).2, 7);
+        if v6 {
+            continue;
+        }
+        // With a heartbeat, "rules" clients look up unknown destinations
+        // before routing; local networks and known routes need none.
+        Array::<_, u64>::try_from(bpf.map_mut("HEARTBEAT").unwrap())
+            .unwrap()
+            .set(0, monotonic_ns(), 0)
+            .unwrap();
+        insert_prefix(&mut bpf, "SYSTEM", "192.168.2.0/24", 1);
+        let lan = frame(&ip(
+            &[192, 168, 2, 1],
+            &[192, 168, 2, 9],
+            17,
+            udp(1, 2, &[0; 8]),
+        ));
+        assert_eq!(run(&bpf, name, &lan, 0).0, UNSPEC);
+        assert_eq!(run(&bpf, name, &packet(other), 0).0, REDIRECT);
+        let mut key = [0; 16];
+        key[..4].copy_from_slice(&REMOTE);
+        let routes = HashMap::<_, [u8; 16], Route>::try_from(bpf.map("ROUTES").unwrap()).unwrap();
+        assert_eq!(routes.get(&key, 0).unwrap().0.action, ROUTE_PENDING);
+        // Proxied and bypassed clients never look up.
+        for src in [proxied, bypassed] {
+            let to = frame(&ip(
+                &octets(src.parse().unwrap()),
+                &[203, 0, 113, 10],
+                17,
+                udp(1, 2, &[0; 8]),
+            ));
+            assert_eq!(run(&bpf, name, &to, 0).0, UNSPEC);
+        }
+        let mut answered = [0; 16];
+        answered[..4].copy_from_slice(&[203, 0, 113, 10]);
+        assert!(routes.get(&answered, 0).is_err());
+    }
+}
+
+#[test]
+#[ignore = "requires root; loads eBPF programs into the kernel"]
+fn egress_applies_client_modes() {
+    let mut bpf = load(false);
+    let peer = [10, 16, 255, 138];
+    insert_prefix(&mut bpf, "SYSTEM", "10.16.255.138/32", 1);
+    Array::<_, u64>::try_from(bpf.map_mut("HEARTBEAT").unwrap())
+        .unwrap()
+        .set(0, monotonic_ns(), 0)
+        .unwrap();
+    let route = |bpf: &Ebpf, ip: [u8; 4]| {
+        let mut key = [0; 16];
+        key[..4].copy_from_slice(&ip);
+        HashMap::<_, [u8; 16], Route>::try_from(bpf.map("ROUTES").unwrap())
+            .unwrap()
+            .get(&key, 0)
+            .ok()
+    };
+    let stats = |bpf: &Ebpf, i: u32| -> u64 {
+        PerCpuArray::<_, u64>::try_from(bpf.map("CLIENT_STATS").unwrap())
+            .unwrap()
+            .get(&i, 0)
+            .unwrap()
+            .iter()
+            .sum()
+    };
+    let egress = |bpf: &Ebpf, packet: &[u8], mark: u32| run(bpf, "edup_egress4", packet, mark).0;
+    // Masqueraded traffic of a classified client.
+    let packet = frame(&ip(&LOCAL, &REMOTE, 6, syn(2)));
+    let other = 0x1234;
+    // Bypassed and proxied clients never look up.
+    assert_eq!(
+        egress(&bpf, &packet, mode_mark(MODE_BYPASS) | other),
+        UNSPEC
+    );
+    assert_eq!(
+        egress(&bpf, &packet, mode_mark(MODE_PROXY) | other),
+        REDIRECT
+    );
+    assert!(route(&bpf, REMOTE).is_none());
+    assert_eq!(stats(&bpf, client_stat::PROXY), 1);
+    // The interface's own networks stay direct even for proxied clients.
+    let to_peer = frame(&ip(&LOCAL, &peer, 6, syn(2)));
+    assert_eq!(egress(&bpf, &to_peer, mode_mark(MODE_PROXY)), UNSPEC);
+    // Without masquerading the tunnel cannot carry a client's packets.
+    let unmasqueraded = frame(&ip(&[192, 168, 1, 60], &REMOTE, 6, syn(2)));
+    assert_eq!(egress(&bpf, &unmasqueraded, mode_mark(MODE_PROXY)), UNSPEC);
+    assert_eq!(stats(&bpf, client_stat::FOREIGN_SOURCE), 1);
+    // "rules" clients were looked up by the classifier, before masquerading;
+    // the egress hook only applies a known route to them.
+    assert_eq!(egress(&bpf, &packet, mode_mark(MODE_RULES)), UNSPEC);
+    assert!(route(&bpf, REMOTE).is_none());
+    assert_eq!(stats(&bpf, client_stat::LOOKUP), 0);
+    // The host's own traffic is looked up here; the re-injected packet may
+    // carry any mode byte and is not asked about again.
+    assert_eq!(egress(&bpf, &packet, 0), REDIRECT);
+    assert_eq!(route(&bpf, REMOTE).unwrap().0.action, ROUTE_PENDING);
+    assert_eq!(stats(&bpf, client_stat::LOOKUP), 1);
+    let reinjected = mode_mark(MODE_RULES) | CLIENT_MARK;
+    assert_eq!(egress(&bpf, &packet, reinjected), UNSPEC);
+    assert_eq!(stats(&bpf, client_stat::LOOKUP), 1);
+    let route_entry = |action| {
+        Route(RouteEntry {
+            since_ns: 0,
+            action,
+            _pad: 0,
+        })
+    };
+    let mut key = [0; 16];
+    key[..4].copy_from_slice(&REMOTE);
+    HashMap::<_, [u8; 16], Route>::try_from(bpf.map_mut("ROUTES").unwrap())
+        .unwrap()
+        .insert(key, route_entry(ROUTE_PROXY), 0)
+        .unwrap();
+    assert_eq!(egress(&bpf, &packet, mode_mark(MODE_RULES)), REDIRECT);
+    assert_eq!(stats(&bpf, client_stat::PROXY), 2);
+    HashMap::<_, [u8; 16], Route>::try_from(bpf.map_mut("ROUTES").unwrap())
+        .unwrap()
+        .insert(key, route_entry(ROUTE_PENDING), 0)
+        .unwrap();
+    // Unclassified traffic uses the host's own mode.
+    let mut config = Array::<_, Config>::try_from(bpf.map("CLIENT_CONFIG").unwrap())
+        .unwrap()
+        .get(&0, 0)
+        .unwrap();
+    config.0.local_mode = MODE_PROXY;
+    Array::<_, Config>::try_from(bpf.map_mut("CLIENT_CONFIG").unwrap())
+        .unwrap()
+        .set(0, config, 0)
+        .unwrap();
+    assert_eq!(egress(&bpf, &packet, 0), REDIRECT);
+    assert_eq!(stats(&bpf, client_stat::PROXY), 3);
+    assert_eq!(stats(&bpf, client_stat::LOOKUP), 1);
+    // A stale heartbeat sends proxied clients the standard route.
+    Array::<_, u64>::try_from(bpf.map_mut("HEARTBEAT").unwrap())
+        .unwrap()
+        .set(0, monotonic_ns() - HEARTBEAT_TIMEOUT_NS - 1, 0)
+        .unwrap();
+    assert_eq!(egress(&bpf, &packet, mode_mark(MODE_PROXY)), UNSPEC);
+}
+
+#[test]
+#[ignore = "requires root; changes interface features"]
+fn udp_gro_is_turned_off_and_restored() {
+    struct Pair;
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            let _ = super::ip(&["link", "del", "edupgro0"]);
+        }
+    }
+    let _ = super::ip(&["link", "del", "edupgro0"]);
+    super::ip(&[
+        "link", "add", "edupgro0", "type", "veth", "peer", "name", "edupgro1",
+    ])
+    .unwrap();
+    let _pair = Pair;
+    let vlan = [
+        "link",
+        "add",
+        "link",
+        "edupgro0",
+        "name",
+        "edupgro0.7",
+        "type",
+        "vlan",
+    ];
+    super::ip(&[&vlan[..], &["id", "7"]].concat()).unwrap();
+    let devices = lower_devices("edupgro0.7");
+    assert_eq!(devices, ["edupgro0.7", "edupgro0"]);
+    // A VLAN takes only the features its lower device offers VLANs.
+    let (names, _) = features("edupgro0").unwrap();
+    let all: Vec<u32> = (0..names.len() as u32)
+        .filter(|&bit| UDP_GRO.contains(&names[bit as usize].as_str()))
+        .collect();
+    assert_eq!(all.len(), UDP_GRO.len());
+    set_features("edupgro0", &all, true).unwrap();
+    let bits: Vec<Vec<u32>> = devices
+        .iter()
+        .map(|dev| active_features(dev, &UDP_GRO).unwrap())
+        .collect();
+    assert_eq!(bits[1], all);
+    {
+        let _gro = UdpGro::disable("edupgro0.7");
+        for dev in &devices {
+            assert!(active_features(dev, &UDP_GRO).unwrap().is_empty(), "{dev}");
+        }
+    }
+    for (dev, bits) in devices.iter().zip(&bits) {
+        assert_eq!(&active_features(dev, &UDP_GRO).unwrap(), bits, "{dev}");
+    }
 }

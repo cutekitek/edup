@@ -5,27 +5,36 @@
 //! device, re-injects those packets, sends KEEPALIVE and runs the DNS
 //! forwarder for domain rules. Without its heartbeat, eBPF leaves all
 //! traffic to the standard route.
+//!
+//! On a router, `from` rules form a permanent client table in eBPF: LAN
+//! interfaces classify each source before masquerading, and the egress hook
+//! proxies or bypasses those clients without lookups. SIGHUP reloads the
+//! table from the configuration file.
 use crate::{
-    config::{Action, Settings, XdpMode},
+    config::{Action, Settings, Target, XdpMode},
     create_device, dns,
     ipset::{Family, IpSet, Prefix, key},
     routes,
-    routing::{self, Rules},
+    routing::{self, Clients, Rules},
     shutdown_signal, temporary, tun_io, tunnel_address,
 };
 use anyhow::{Context, Result, bail, ensure};
 use aya::{
     Ebpf, Pod,
-    maps::{Array, HashMap, MapData, PerCpuArray},
+    maps::{Array, HashMap, MapData, PerCpuArray, lpm_trie},
     programs::{SchedClassifier, TcAttachType, Xdp, tc, tc::SchedClassifierLink, xdp::XdpLink},
     util::KernelVersion,
 };
 use edup_common::{
     key::derive_key,
-    maps::{CLIENT_MARK, ClientConfig, ROUTE_BYPASS, ROUTE_PROXY, RouteEntry, client_stat},
+    maps::{
+        CLIENT_ENTRIES, CLIENT_MARK, ClientConfig, Keystream, MODE_BYPASS, MODE_PROXY, MODE_RULES,
+        ROUTE_BYPASS, ROUTE_PROXY, RouteEntry, SYSTEM_ENTRIES, client_stat,
+    },
     wire::{self, Key},
 };
 use std::{
+    collections::BTreeMap,
     fs, io,
     net::{IpAddr, SocketAddr, UdpSocket},
     os::fd::AsRawFd,
@@ -51,6 +60,18 @@ unsafe impl Pod for Config {}
 #[derive(Clone, Copy)]
 struct Route(RouteEntry);
 unsafe impl Pod for Route {}
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Stream(Keystream);
+unsafe impl Pod for Stream {}
+
+/// Stores the key's stream words, which eBPF XORs with every packet.
+fn set_keystream(bpf: &mut Ebpf, key: &Key) -> Result<()> {
+    let mut map: Array<_, Stream> =
+        Array::try_from(bpf.map_mut("KEYSTREAM").context("missing KEYSTREAM")?)?;
+    map.set(0, Stream(Keystream::new(key)), 0)?;
+    Ok(())
+}
 
 #[derive(Default)]
 struct Counters {
@@ -60,22 +81,34 @@ struct Counters {
     keepalive_received: AtomicU64,
 }
 
-pub fn run(cfg: Settings) -> Result<()> {
+/// SIGHUP: reload the client table.
+static RELOAD: AtomicBool = AtomicBool::new(false);
+extern "C" fn reload_requested(_: libc::c_int) {
+    RELOAD.store(true, Relaxed);
+}
+
+pub fn run(cfg: Settings, path: &Path) -> Result<()> {
     let (stop, event) = shutdown_signal()?;
+    let handler: extern "C" fn(libc::c_int) = reload_requested;
+    ensure!(
+        unsafe { libc::signal(libc::SIGHUP, handler as libc::sighandler_t) } != libc::SIG_ERR,
+        "install SIGHUP handler: {}",
+        io::Error::last_os_error()
+    );
     routes::ensure_available(&cfg.interface)?;
+    // Not while another client runs: its TUN interface would exist.
+    routes::clean_dns()?;
     // Rule-sets download before the datapath can capture any traffic.
     let rules = routing::resolve(&cfg)?;
+    let clients = routing::clients(&cfg);
     let v6 = cfg.server.is_ipv6();
+    let family = Family::of(cfg.server.ip());
     let physical = routes::PhysicalRoute::discover(cfg.server.ip())?;
     let (dev, physical_index) = physical.device();
     let dev = dev.to_owned();
     let local = physical.source();
     let link = Path::new("/sys/class/net").join(&dev);
-    let kind: u32 = fs::read_to_string(link.join("type"))?.trim().parse()?;
-    ensure!(
-        kind == 1,
-        "xdp mode needs an Ethernet interface; {dev} is not one"
-    );
+    let l3 = link_layer(&dev)?;
     let link_mtu: usize = fs::read_to_string(link.join("mtu"))?.trim().parse()?;
     let overhead = if v6 {
         wire::OVERHEAD_V6
@@ -110,6 +143,10 @@ pub fn run(cfg: Settings) -> Result<()> {
             others.join(", ")
         );
     }
+    warn_flowtables();
+    if !(rules.uses_dns() && cfg.dns.set_system) {
+        warn_proxied_resolvers(&rules, &clients, local, &system, v6)?;
+    }
 
     // KEEPALIVE and the datapath share this socket's port.
     let socket = UdpSocket::bind((local, 0)).context("bind UDP on physical source address")?;
@@ -123,6 +160,7 @@ pub fn run(cfg: Settings) -> Result<()> {
 
     let mut bpf = Ebpf::load(OBJECT).context("load embedded eBPF object")?;
     let key = derive_key(&cfg.password);
+    set_keystream(&mut bpf, &key)?;
     let mut config = ClientConfig {
         key0: key.k0,
         key1: key.k1,
@@ -131,20 +169,35 @@ pub fn run(cfg: Settings) -> Result<()> {
         local_port_be: socket.local_addr()?.port().to_be(),
         mtu: cfg.mtu,
         v6: v6.into(),
+        local_mode: mode(clients.target(local)),
         physical: physical_index,
         segment: segment.index,
         tun: tun.if_index()?,
         mark: CLIENT_MARK,
         ..ClientConfig::default()
     };
+    // XDP decapsulates before GRO; TC on interfaces without a link-layer
+    // header runs after it.
+    if l3 {
+        match segment.inbound(v6) {
+            Ok(Some((index, mac))) => {
+                config.inbound = index;
+                config.inbound_mac = mac;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("warning: {error:#}; decapsulated packets skip GRO and use one CPU")
+            }
+        }
+    }
     config.local[..octets(local).len()].copy_from_slice(&octets(local));
     let server = octets(cfg.server.ip());
     config.server[..server.len()].copy_from_slice(&server);
-    Array::<_, Config>::try_from(
-        bpf.map_mut("CLIENT_CONFIG")
+    let mut client_config: Array<_, Config> = Array::try_from(
+        bpf.take_map("CLIENT_CONFIG")
             .context("missing CLIENT_CONFIG")?,
-    )?
-    .set(0, Config(config), 0)?;
+    )?;
+    client_config.set(0, Config(config), 0)?;
     let cache: HashMap<_, [u8; 16], Route> =
         HashMap::try_from(bpf.take_map("ROUTES").context("missing ROUTES")?)?;
     let mut heartbeat: Array<_, u64> =
@@ -153,8 +206,32 @@ pub fn run(cfg: Settings) -> Result<()> {
         bpf.take_map("CLIENT_STATS")
             .context("missing CLIENT_STATS")?,
     )?;
+    let mut direct = PrefixTable::new(bpf.take_map("SYSTEM").context("missing SYSTEM")?)?;
+    direct.update(
+        direct_prefixes(v6)?,
+        SYSTEM_ENTRIES,
+        "local networks and addresses",
+    )?;
+    let mut table = PrefixTable::new(bpf.take_map("CLIENTS").context("missing CLIENTS")?)?;
+    table.update(
+        client_entries(&clients, family),
+        CLIENT_ENTRIES,
+        "\"from\" prefixes",
+    )?;
     heartbeat.set(0, monotonic_ns(), 0)?;
-    let datapath = Datapath::attach(&mut bpf, cfg.xdp_mode, &dev, &segment.inner, v6)?;
+    let datapath = Datapath::attach(&mut bpf, cfg.xdp_mode, &dev, l3, &segment.inner, v6)?;
+    // Driver XDP sees packets before GRO merges them.
+    let _gro = (datapath.mode != "driver XDP").then(|| UdpGro::disable(&dev));
+    let _steering = if l3 { Steering::pipeline(&dev) } else { None };
+    let excluded = [
+        dev.clone(),
+        cfg.interface.clone(),
+        segment.outer.clone(),
+        segment.inner.clone(),
+        "lo".into(),
+    ];
+    let mut lan = Lan::default();
+    lan.update(&mut bpf, &clients, family, &excluded, v6)?;
 
     let router = Router {
         rules: &rules,
@@ -163,10 +240,12 @@ pub fn run(cfg: Settings) -> Result<()> {
         cache: Mutex::new(cache),
     };
     let address = tunnel_address(&cfg)?;
+    let forwarder = SocketAddr::new(address, cfg.dns.port);
+    let mut _system_dns = None;
     let dns = if rules.uses_dns() {
-        let listener = dns::Listener::bind(address)?;
+        let listener = dns::Listener::bind(forwarder)?;
         if cfg.dns.set_system {
-            routes::set_dns(&cfg.interface, config.tun, address)?;
+            _system_dns = routes::set_dns(&cfg.interface, config.tun, forwarder)?;
         }
         Some((
             dns::Forwarder::new(&rules, &router, cfg.dns_servers()),
@@ -177,14 +256,15 @@ pub fn run(cfg: Settings) -> Result<()> {
     };
     let counts = Counters::default();
     println!(
-        "edup client ready: {} {}, server={}, MTU={}, mode=xdp ({} XDP on {dev}, source {local}){}",
+        "edup client ready: {} {}, server={}, MTU={}, mode=xdp ({} on {dev}, source {local}){}{}",
         cfg.interface,
         address,
         cfg.server,
         cfg.mtu,
         datapath.mode,
+        clients_text(&table, &lan, local, config.local_mode),
         if dns.is_some() {
-            format!(", DNS={}", SocketAddr::new(address, 53))
+            format!(", DNS={forwarder}")
         } else {
             String::new()
         }
@@ -209,6 +289,43 @@ pub fn run(cfg: Settings) -> Result<()> {
             .collect();
         eprintln!("{}", values.join(" "));
     };
+    let core = configuration_core(path)?;
+    let mut reload = || {
+        let result = (|| -> Result<()> {
+            let next = Settings::load(path)?;
+            if configuration_core(path)? != core {
+                eprintln!(
+                    "warning: the configuration changed beyond \"from\" rules; restart edup-client to apply it"
+                );
+            }
+            ensure!(
+                next.server.is_ipv6() == v6,
+                "the server's address family changed"
+            );
+            let clients = routing::clients(&next);
+            direct.update(
+                direct_prefixes(v6)?,
+                SYSTEM_ENTRIES,
+                "local networks and addresses",
+            )?;
+            table.update(
+                client_entries(&clients, family),
+                CLIENT_ENTRIES,
+                "\"from\" prefixes",
+            )?;
+            config.local_mode = mode(clients.target(local));
+            client_config.set(0, Config(config), 0)?;
+            lan.update(&mut bpf, &clients, family, &excluded, v6)?;
+            println!(
+                "edup client reloaded{}",
+                clients_text(&table, &lan, local, config.local_mode)
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("reload failed, keeping the previous client table: {error:#}");
+        }
+    };
     let result = std::thread::scope(|scope| {
         if let Some((forwarder, listener)) = &dns {
             forwarder.spawn(scope, listener, &stop);
@@ -230,7 +347,7 @@ pub fn run(cfg: Settings) -> Result<()> {
             let _ = event.trigger();
             result
         });
-        let result = keepalive(&socket, &cfg, &key, &counts, &stop, &report);
+        let result = keepalive(&socket, &cfg, &key, &counts, &stop, &report, &mut reload);
         stop.store(true, Relaxed);
         let _ = event.trigger();
         let looked_up = worker
@@ -241,6 +358,7 @@ pub fn run(cfg: Settings) -> Result<()> {
     // Detach the egress hook first: nothing may be redirected to the veth or
     // TUN device while they disappear.
     drop(datapath);
+    drop(lan);
     if let Some((forwarder, _)) = dns {
         eprintln!(
             "dns_queries={} dns_failures={} dns_routes={}",
@@ -253,29 +371,292 @@ pub fn run(cfg: Settings) -> Result<()> {
     result
 }
 
+/// Whether `dev` carries IP packets without a link-layer header, as PPP;
+/// otherwise it must be Ethernet.
+fn link_layer(dev: &str) -> Result<bool> {
+    const ETHER: u32 = 1;
+    const PPP: u32 = 512;
+    const IPGRE: u32 = 778;
+    const NONE: u32 = 65534;
+    let path = Path::new("/sys/class/net").join(dev).join("type");
+    let kind: u32 = fs::read_to_string(&path)
+        .with_context(|| format!("read {}", path.display()))?
+        .trim()
+        .parse()?;
+    match kind {
+        ETHER => Ok(false),
+        PPP | IPGRE | NONE => Ok(true),
+        _ => bail!(
+            "xdp mode needs an Ethernet, PPP or other IP-level interface; {dev} is type {kind}"
+        ),
+    }
+}
+
+/// Offloaded flows leave the stack before the egress hook sees them.
+fn warn_flowtables() {
+    let Ok(out) = Command::new("nft").args(["list", "flowtables"]).output() else {
+        return;
+    };
+    if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("flowtable") {
+        eprintln!(
+            "warning: nftables flow offloading is active; offloaded connections bypass edup (OpenWrt: disable flow offloading in the firewall settings)"
+        );
+    }
+}
+
+/// The host's own DNS upstreams follow the rules like its other traffic.
+/// Through the tunnel they see the server's address, which resolvers that
+/// only answer their own network, as ISP resolvers often do, refuse.
+fn warn_proxied_resolvers(
+    rules: &Rules,
+    clients: &Clients,
+    local: IpAddr,
+    system: &IpSet,
+    v6: bool,
+) -> Result<()> {
+    let mut direct: IpSet = system.clone();
+    for (_, prefix) in routes::interface_prefixes(v6)? {
+        direct = direct.union(&IpSet::from_ranges(vec![prefix.range()]));
+    }
+    for ip in routes::dnsmasq_upstreams() {
+        if Family::of(ip) != Family::of(rules.server)
+            || ip == rules.server
+            || !unicast(ip)
+            || direct.contains(key(ip))
+        {
+            continue;
+        }
+        let proxied = match clients.target(local) {
+            Target::Proxy => true,
+            Target::Bypass => false,
+            Target::Rules => rules.address_action(ip) == Action::Proxy,
+        };
+        if proxied {
+            eprintln!(
+                "warning: dnsmasq's upstream DNS server {ip} is reached through the tunnel; if it only answers its own network (as ISP resolvers often do), add a bypass rule for it or use another resolver"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The configuration without `from` rules: a SIGHUP applies only those.
+fn configuration_core(path: &Path) -> Result<serde_json::Value> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut value: serde_json::Value = edup_common::json::parse(&text)
+        .map_err(|e| anyhow::anyhow!("invalid configuration {}: {e}", path.display()))?;
+    if let Some(routes) = value
+        .pointer_mut("/routing/routes")
+        .and_then(|r| r.as_array_mut())
+    {
+        routes.retain(|r| r.get("from").is_none());
+    }
+    Ok(value)
+}
+
+fn mode(target: Target) -> u8 {
+    match target {
+        Target::Proxy => MODE_PROXY,
+        Target::Bypass => MODE_BYPASS,
+        Target::Rules => MODE_RULES,
+    }
+}
+
+fn clients_text(table: &PrefixTable, lan: &Lan, local: IpAddr, local_mode: u8) -> String {
+    if table.entries.is_empty() && lan.links.is_empty() {
+        return String::new();
+    }
+    let interfaces: Vec<&str> = lan.links.keys().map(String::as_str).collect();
+    format!(
+        ", clients: {} prefixes on {}{}",
+        table.entries.len(),
+        if interfaces.is_empty() {
+            "no interface".to_string()
+        } else {
+            interfaces.join(", ")
+        },
+        match local_mode {
+            MODE_PROXY => format!(", {local} proxied"),
+            MODE_BYPASS => format!(", {local} bypassed"),
+            _ => String::new(),
+        }
+    )
+}
+
+type Entries = BTreeMap<(u8, [u8; 16]), u32>;
+
+fn entry(prefix: &Prefix) -> (u8, [u8; 16]) {
+    let mut data = [0; 16];
+    let address = octets(prefix.addr);
+    data[..address.len()].copy_from_slice(&address);
+    (prefix.len, data)
+}
+
+fn client_entries(clients: &Clients, family: Family) -> Entries {
+    clients
+        .entries(family)
+        .iter()
+        .map(|(prefix, target)| (entry(prefix), u32::from(mode(*target))))
+        .collect()
+}
+
+/// Destinations that need no route: every interface's networks and the
+/// host's own addresses.
+fn direct_prefixes(v6: bool) -> Result<Entries> {
+    let mut entries: Entries = routes::interface_prefixes(v6)?
+        .iter()
+        .map(|(_, prefix)| (entry(prefix), 1))
+        .collect();
+    for address in local_addresses(v6)? {
+        entries.insert(entry(&Prefix::host(address)), 1);
+    }
+    Ok(entries)
+}
+
+/// An eBPF LPM trie and the entries userspace stored in it.
+struct PrefixTable {
+    map: lpm_trie::LpmTrie<MapData, [u8; 16], u32>,
+    entries: Entries,
+}
+impl PrefixTable {
+    fn new(map: aya::maps::Map) -> Result<Self> {
+        Ok(Self {
+            map: lpm_trie::LpmTrie::try_from(map)?,
+            entries: Entries::new(),
+        })
+    }
+    /// Inserts new and changed entries before removing old ones.
+    fn update(&mut self, wanted: Entries, limit: u32, what: &str) -> Result<()> {
+        ensure!(
+            wanted.len() <= limit as usize,
+            "{} {what}; at most {limit} are supported",
+            wanted.len()
+        );
+        for (&(len, data), value) in &wanted {
+            if self.entries.get(&(len, data)) != Some(value) {
+                self.map
+                    .insert(&lpm_trie::Key::new(len.into(), data), value, 0)
+                    .with_context(|| format!("store {what}"))?;
+            }
+        }
+        for &(len, data) in self.entries.keys() {
+            if !wanted.contains_key(&(len, data)) {
+                self.map
+                    .remove(&lpm_trie::Key::new(len.into(), data))
+                    .with_context(|| format!("remove {what}"))?;
+            }
+        }
+        self.entries = wanted;
+        Ok(())
+    }
+}
+
+/// Classifiers on the LAN interfaces whose networks contain clients.
+#[derive(Default)]
+struct Lan {
+    links: BTreeMap<String, SchedClassifierLink>,
+}
+impl Lan {
+    fn update(
+        &mut self,
+        bpf: &mut Ebpf,
+        clients: &Clients,
+        family: Family,
+        excluded: &[String],
+        v6: bool,
+    ) -> Result<()> {
+        let mut wanted = Vec::new();
+        if !clients.is_empty() {
+            for (dev, prefix) in routes::interface_prefixes(v6)? {
+                let network = IpSet::from_ranges(vec![prefix.range()]);
+                if prefix.family() == family
+                    && !excluded.contains(&dev)
+                    && !wanted.contains(&dev)
+                    && !network.intersection(&clients.listed).is_empty()
+                {
+                    wanted.push(dev);
+                }
+            }
+            if wanted.is_empty() {
+                eprintln!(
+                    "warning: no interface network contains a \"from\" source; only this host's own traffic follows the client table"
+                );
+            }
+        }
+        self.links.retain(|dev, _| wanted.contains(dev));
+        for dev in wanted {
+            if self.links.contains_key(&dev) {
+                continue;
+            }
+            let name = format!(
+                "edup_classify{}{}",
+                if v6 { 6 } else { 4 },
+                if link_layer(&dev)? { "_l3" } else { "" }
+            );
+            let program = classifier(bpf, &name)?;
+            if program.fd().is_err() {
+                program
+                    .load()
+                    .with_context(|| format!("kernel rejected {name}"))?;
+            }
+            // Before Linux 6.6 (no TCX), programs attach to clsact qdiscs.
+            if !KernelVersion::current().is_ok_and(|v| v >= KernelVersion::new(6, 6, 0)) {
+                let _ = tc::qdisc_add_clsact(&dev);
+                let _ = tc::qdisc_detach_program(&dev, TcAttachType::Ingress, &name);
+            }
+            let id = program
+                .attach(&dev, TcAttachType::Ingress)
+                .with_context(|| format!("attach {name} to {dev}"))?;
+            self.links.insert(dev, program.take_link(id)?);
+        }
+        Ok(())
+    }
+}
+
 /// Attached programs, detached in field order.
 struct Datapath {
     _egress: SchedClassifierLink,
-    _ingress: XdpLink,
+    _ingress: Ingress,
     _encap: SchedClassifierLink,
     mode: &'static str,
+}
+enum Ingress {
+    Xdp(#[allow(dead_code)] XdpLink),
+    Tc(#[allow(dead_code)] SchedClassifierLink),
 }
 impl Datapath {
     /// Loads every program before attaching any, and attaches the egress hook
     /// last, when the encapsulation and decapsulation paths already work.
-    fn attach(bpf: &mut Ebpf, mode: XdpMode, dev: &str, encap: &str, v6: bool) -> Result<Self> {
+    fn attach(
+        bpf: &mut Ebpf,
+        mode: XdpMode,
+        dev: &str,
+        l3: bool,
+        encap: &str,
+        v6: bool,
+    ) -> Result<Self> {
         let family = if v6 { 6 } else { 4 };
-        let egress_name = format!("edup_egress{family}");
+        let suffix = if l3 { "_l3" } else { "" };
+        let egress_name = format!("edup_egress{family}{suffix}");
         let encap_name = format!("edup_encap{family}");
-        let ingress_name = format!("edup_ingress{family}");
-        for name in [&egress_name, &encap_name] {
+        let ingress_name = if l3 {
+            format!("edup_decap{family}_l3")
+        } else {
+            format!("edup_ingress{family}")
+        };
+        let mut classifiers = vec![&egress_name, &encap_name];
+        if l3 {
+            classifiers.push(&ingress_name);
+        } else {
+            xdp(bpf, &ingress_name)?
+                .load()
+                .with_context(|| format!("kernel rejected {ingress_name}"))?;
+        }
+        for name in classifiers {
             classifier(bpf, name)?
                 .load()
                 .with_context(|| format!("kernel rejected {name}"))?;
         }
-        xdp(bpf, &ingress_name)?
-            .load()
-            .with_context(|| format!("kernel rejected {ingress_name}"))?;
         // Before Linux 6.6 (no TCX), programs attach to clsact qdiscs and
         // outlive a crashed client. Its egress hook falls back to the
         // standard route without heartbeat; replace it.
@@ -284,33 +665,50 @@ impl Datapath {
                 let _ = tc::qdisc_add_clsact(name);
             }
             let _ = tc::qdisc_detach_program(dev, TcAttachType::Egress, &egress_name);
+            if l3 {
+                let _ = tc::qdisc_detach_program(dev, TcAttachType::Ingress, &ingress_name);
+            }
         }
         let program = classifier(bpf, &encap_name)?;
         let id = program
             .attach(encap, TcAttachType::Ingress)
             .with_context(|| format!("attach {encap_name} to {encap}"))?;
         let encap_link = program.take_link(id)?;
-        let program = xdp(bpf, &ingress_name)?;
-        let attach = |program: &mut Xdp, mode| program.attach(dev, mode);
-        let (id, mode) = match mode {
-            XdpMode::Driver => (attach(program, aya::programs::XdpMode::Driver)?, "driver"),
-            XdpMode::Skb => (attach(program, aya::programs::XdpMode::Skb)?, "skb"),
-            XdpMode::Auto => match attach(program, aya::programs::XdpMode::Driver) {
-                Ok(id) => (id, "driver"),
-                Err(error) => {
-                    eprintln!("native XDP unavailable on {dev} ({error}); using generic XDP");
-                    (attach(program, aya::programs::XdpMode::Skb)?, "skb")
-                }
-            },
+        let (ingress, mode) = if l3 {
+            if mode != XdpMode::Auto {
+                eprintln!("{dev} has no link-layer header; decapsulating in TC, not XDP");
+            }
+            let program = classifier(bpf, &ingress_name)?;
+            let id = program
+                .attach(dev, TcAttachType::Ingress)
+                .with_context(|| format!("attach {ingress_name} to {dev}"))?;
+            (Ingress::Tc(program.take_link(id)?), "TC")
+        } else {
+            let program = xdp(bpf, &ingress_name)?;
+            let attach = |program: &mut Xdp, mode| program.attach(dev, mode);
+            let (id, mode) = match mode {
+                XdpMode::Driver => (
+                    attach(program, aya::programs::XdpMode::Driver)?,
+                    "driver XDP",
+                ),
+                XdpMode::Skb => (attach(program, aya::programs::XdpMode::Skb)?, "skb XDP"),
+                XdpMode::Auto => match attach(program, aya::programs::XdpMode::Driver) {
+                    Ok(id) => (id, "driver XDP"),
+                    Err(error) => {
+                        eprintln!("native XDP unavailable on {dev} ({error}); using generic XDP");
+                        (attach(program, aya::programs::XdpMode::Skb)?, "skb XDP")
+                    }
+                },
+            };
+            (Ingress::Xdp(program.take_link(id)?), mode)
         };
-        let ingress_link = program.take_link(id)?;
         let program = classifier(bpf, &egress_name)?;
         let id = program
             .attach(dev, TcAttachType::Egress)
             .with_context(|| format!("attach {egress_name} to {dev}"))?;
         Ok(Self {
             _egress: program.take_link(id)?,
-            _ingress: ingress_link,
+            _ingress: ingress,
             _encap: encap_link,
             mode,
         })
@@ -435,7 +833,7 @@ fn lookups(
         for i in 0..num {
             let packet = &reader.packets[i][wire::HDR_LEN..wire::HDR_LEN + reader.sizes[i]];
             counts.lookups.fetch_add(1, Relaxed);
-            let Some(destination) = destination(packet, local) else {
+            let Some(destination) = destination(packet, local.is_ipv6()) else {
                 counts.dropped.fetch_add(1, Relaxed);
                 continue;
             };
@@ -453,13 +851,14 @@ fn lookups(
     }
     Ok(())
 }
-/// The destination of a packet the local stack sent from the physical address.
-fn destination(packet: &[u8], local: IpAddr) -> Option<IpAddr> {
-    match (packet.first()? >> 4, local) {
-        (4, IpAddr::V4(local)) if packet.len() >= 20 && packet[12..16] == local.octets() => {
+/// The destination of a looked-up packet: one the local stack sent, or one
+/// a LAN client sent, before masquerading.
+fn destination(packet: &[u8], v6: bool) -> Option<IpAddr> {
+    match (packet.first()? >> 4, v6) {
+        (4, false) if packet.len() >= 20 => {
             Some(IpAddr::from(<[u8; 4]>::try_from(&packet[16..20]).ok()?))
         }
-        (6, IpAddr::V6(local)) if packet.len() >= 40 && packet[8..24] == local.octets() => {
+        (6, true) if packet.len() >= 40 => {
             Some(IpAddr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?))
         }
         _ => None,
@@ -467,7 +866,8 @@ fn destination(packet: &[u8], local: IpAddr) -> Option<IpAddr> {
 }
 
 /// KEEPALIVE keeps the server's endpoint for this socket current; the server
-/// answers each one. Tunnel data never reaches the socket: XDP takes it first.
+/// answers each one. Tunnel data never reaches the socket: eBPF takes it first.
+/// Reload requests run here, between receive timeouts.
 fn keepalive(
     socket: &UdpSocket,
     cfg: &Settings,
@@ -475,12 +875,16 @@ fn keepalive(
     counts: &Counters,
     stop: &AtomicBool,
     report: &dyn Fn(),
+    reload: &mut dyn FnMut(),
 ) -> Result<()> {
     let mut buf = [0u8; 2048];
     let mut next = Instant::now();
     let diagnostics = std::env::var_os("EDUP_DIAGNOSTICS").is_some();
     let mut report_at = Instant::now() + Duration::from_secs(5);
     while !stop.load(Relaxed) {
+        if RELOAD.swap(false, Relaxed) {
+            reload();
+        }
         if diagnostics && Instant::now() >= report_at {
             report();
             report_at = Instant::now() + Duration::from_secs(5);
@@ -569,6 +973,25 @@ fn monotonic_ns() -> u64 {
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }
 
+/// Every address of the family on any interface.
+fn local_addresses(v6: bool) -> Result<Vec<IpAddr>> {
+    #[derive(serde::Deserialize)]
+    struct Link {
+        addr_info: Vec<Address>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Address {
+        local: Option<IpAddr>,
+    }
+    let json = ip(&["-j", if v6 { "-6" } else { "-4" }, "addr", "show"])?;
+    let links: Vec<Link> = serde_json::from_str(&json).context("read addresses")?;
+    Ok(links
+        .iter()
+        .flat_map(|l| &l.addr_info)
+        .filter_map(|a| a.local)
+        .collect())
+}
+
 /// Global addresses of `local`'s family on `dev` other than `local`, such as
 /// IPv6 temporary addresses.
 fn other_addresses(dev: &str, local: IpAddr) -> Result<Vec<String>> {
@@ -643,7 +1066,8 @@ impl Segment {
         let mtu = mtu.to_string();
         ip(&[
             "link", "add", &outer, "mtu", &mtu, "type", "veth", "peer", "name", &inner, "mtu", &mtu,
-        ])?;
+        ])
+        .context("create the segmentation veth pair (needs the veth module; OpenWrt: kmod-veth)")?;
         let mut guard = Self {
             outer,
             inner,
@@ -666,6 +1090,59 @@ impl Segment {
         ensure!(guard.index != 0, "interface {} vanished", guard.outer);
         Ok(guard)
     }
+
+    /// Prepares the reverse direction for TC decapsulation, which runs after
+    /// GRO: inner packets sent into `<interface>e` reach the stack through
+    /// `<interface>s`, whose GRO merges TCP segments and whose packet
+    /// steering spreads inner flows over all CPUs. Returns the sending end's
+    /// index and the receiving end's MAC address, or None where reverse path
+    /// filtering would drop packets arriving there.
+    fn inbound(&self, v6: bool) -> Result<Option<(u32, [u8; 6])>> {
+        let strict = |path: &str| fs::read_to_string(path).is_ok_and(|v| v.trim() == "1");
+        if !v6 && strict("/proc/sys/net/ipv4/conf/all/rp_filter") {
+            eprintln!(
+                "note: strict reverse path filtering (net.ipv4.conf.all.rp_filter=1) keeps tunnel packets on the plain receive path"
+            );
+            return Ok(None);
+        }
+        let outer = &self.outer;
+        let conf = |family: &str, key: &str, value: &str| {
+            fs::write(format!("/proc/sys/net/{family}/conf/{outer}/{key}"), value)
+                .with_context(|| format!("set {family} {key} on {outer}"))
+        };
+        if v6 {
+            // Receive IPv6 without addresses of its own.
+            conf("ipv6", "addr_gen_mode", "1")?;
+            conf("ipv6", "accept_ra", "0")?;
+            conf("ipv6", "disable_ipv6", "0")?;
+        } else {
+            conf("ipv4", "rp_filter", "0")?;
+        }
+        // Without receive checksum offload GRO verifies the inner checksums,
+        // which merging would otherwise hide from the receiver. Veth skips GRO
+        // for packets from a sender with TSO.
+        ethtool_set(outer, ETHTOOL_SRXCSUM, 0)
+            .and_then(|()| ethtool_set(outer, ETHTOOL_SGRO, 1))
+            .and_then(|()| ethtool_set(&self.inner, ETHTOOL_STSO, 0))
+            .with_context(|| format!("enable GRO on {outer}"))?;
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get().min(32));
+        if cpus > 1 {
+            let mask = format!("{:x}", (1u64 << cpus) - 1);
+            let path = format!("/sys/class/net/{outer}/queues/rx-0/rps_cpus");
+            if let Err(error) = fs::write(&path, mask) {
+                eprintln!("warning: packet steering on {outer}: {error}");
+            }
+        }
+        let address = fs::read_to_string(format!("/sys/class/net/{outer}/address"))?;
+        let mut mac = [0u8; 6];
+        for (byte, part) in mac.iter_mut().zip(address.trim().split(':')) {
+            *byte = u8::from_str_radix(part, 16)?;
+        }
+        let name = std::ffi::CString::new(self.inner.as_str())?;
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        ensure!(index != 0, "interface {} vanished", self.inner);
+        Ok(Some((index, mac)))
+    }
 }
 impl Drop for Segment {
     fn drop(&mut self) {
@@ -676,10 +1153,163 @@ impl Drop for Segment {
     }
 }
 
+/// UDP receive offloads that merge consecutive datagrams of one flow into
+/// one packet. Decapsulation after GRO (TC, generic XDP) takes only single
+/// tunnel datagrams; merged ones would reach the client's socket and be lost.
+const UDP_GRO: [&str; 2] = ["rx-gro-list", "rx-udp-gro-forwarding"];
+
+/// Turns UDP GRO off on the physical interface and the devices below it,
+/// where GRO runs, and back on when dropped. A crashed client leaves it off.
+struct UdpGro(Vec<(String, Vec<u32>)>);
+impl UdpGro {
+    fn disable(dev: &str) -> Self {
+        let mut disabled = Vec::new();
+        for name in lower_devices(dev) {
+            let result = active_features(&name, &UDP_GRO)
+                .and_then(|bits| set_features(&name, &bits, false).map(|()| bits));
+            match result {
+                Ok(bits) if !bits.is_empty() => disabled.push((name, bits)),
+                Ok(_) => {}
+                Err(error) => eprintln!(
+                    "warning: cannot turn off UDP GRO on {name} ({error:#}); merged tunnel packets will be dropped"
+                ),
+            }
+        }
+        if !disabled.is_empty() {
+            let names: Vec<&str> = disabled.iter().map(|(name, _)| name.as_str()).collect();
+            eprintln!(
+                "UDP GRO ({}) off on {} while the client runs",
+                UDP_GRO.join(", "),
+                names.join(", ")
+            );
+        }
+        Self(disabled)
+    }
+}
+impl Drop for UdpGro {
+    fn drop(&mut self) {
+        for (name, bits) in &self.0 {
+            if let Err(error) = set_features(name, bits, true) {
+                eprintln!("cannot turn UDP GRO back on for {name}: {error:#}");
+            }
+        }
+    }
+}
+
+/// Packet steering of an interface without a link-layer header, restored
+/// when dropped. All tunnel packets form one flow and steer to one CPU, which
+/// then receives, decapsulates and merges them. Steering the interface to the
+/// CPUs that do not process the devices below it splits that work in two.
+struct Steering {
+    path: String,
+    previous: String,
+}
+impl Steering {
+    fn pipeline(dev: &str) -> Option<Self> {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get().min(32));
+        let all = (1u64 << cpus) - 1;
+        let read = |dev: &str| {
+            let path = format!("/sys/class/net/{dev}/queues/rx-0/rps_cpus");
+            let text = fs::read_to_string(&path).ok()?;
+            let mask = u64::from_str_radix(&text.trim().replace(',', ""), 16).ok()?;
+            Some((path, text.trim().to_owned(), mask))
+        };
+        let (path, previous, current) = read(dev)?;
+        // The lower devices' CPUs, when their steering names some but not all.
+        let lower = lower_devices(dev)
+            .iter()
+            .skip(1)
+            .filter_map(|d| read(d))
+            .fold(0, |mask, (_, _, m)| mask | (m & all));
+        let wanted = all & !lower;
+        if cpus < 2 || lower == 0 || wanted == 0 || current == wanted {
+            return None;
+        }
+        if let Err(error) = fs::write(&path, format!("{wanted:x}")) {
+            eprintln!("warning: packet steering on {dev}: {error}");
+            return None;
+        }
+        eprintln!("{dev} steered to CPU mask {wanted:x} (was {previous}) while the client runs");
+        Some(Self { path, previous })
+    }
+}
+impl Drop for Steering {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, &self.previous);
+    }
+}
+
+/// `dev` and the devices it receives through: PPPoE's Ethernet devices and
+/// `lower_*` links (VLAN, macvlan, bond, DSA).
+fn lower_devices(dev: &str) -> Vec<String> {
+    let mut out = vec![dev.to_owned()];
+    let mut i = 0;
+    while i < out.len() {
+        let link = Path::new("/sys/class/net").join(&out[i]);
+        let mut found = Vec::new();
+        if fs::read_to_string(link.join("type")).is_ok_and(|t| t.trim() == "512") {
+            // Id Address Device
+            let sessions = fs::read_to_string("/proc/net/pppoe").unwrap_or_default();
+            found.extend(
+                sessions
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| Some(l.split_whitespace().nth(2)?.to_owned())),
+            );
+        }
+        for entry in fs::read_dir(&link).into_iter().flatten().flatten() {
+            if let Some(name) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("lower_"))
+            {
+                found.push(name.to_owned());
+            }
+        }
+        for name in found {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 const SIOCETHTOOL: libc::c_ulong = 0x8946;
+const ETHTOOL_SRXCSUM: u32 = 0x15;
 const ETHTOOL_STXCSUM: u32 = 0x17;
+const ETHTOOL_GSTRINGS: u32 = 0x1b;
 const ETHTOOL_STSO: u32 = 0x1f;
 const ETHTOOL_SGSO: u32 = 0x24;
+const ETHTOOL_SGRO: u32 = 0x2c;
+const ETHTOOL_GSSET_INFO: u32 = 0x37;
+const ETHTOOL_GFEATURES: u32 = 0x3a;
+const ETHTOOL_SFEATURES: u32 = 0x3b;
+const ETH_SS_FEATURES: u32 = 4;
+const ETH_GSTRING_LEN: usize = 32;
+
+/// SIOCETHTOOL with `data` as the command structure.
+fn ethtool<T: ?Sized>(name: &str, data: &mut T) -> Result<()> {
+    #[repr(C)]
+    struct Request {
+        name: [u8; 16],
+        data: *mut libc::c_void,
+        _pad: [u8; 16],
+    }
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+    let mut request = Request {
+        name: [0; 16],
+        data: (data as *mut T).cast(),
+        _pad: [0; 16],
+    };
+    ensure!(name.len() < 16, "interface name too long");
+    request.name[..name.len()].copy_from_slice(name.as_bytes());
+    // Feature requests may return flags above zero.
+    let rc = unsafe { libc::ioctl(socket.as_raw_fd(), SIOCETHTOOL as _, &raw mut request) };
+    ensure!(rc >= 0, "ethtool: {}", io::Error::last_os_error());
+    Ok(())
+}
 
 /// Legacy single-feature ethtool request, as `ethtool -K <name> tx off`.
 fn ethtool_set(name: &str, command: u32, value: u32) -> Result<()> {
@@ -688,26 +1318,91 @@ fn ethtool_set(name: &str, command: u32, value: u32) -> Result<()> {
         cmd: u32,
         data: u32,
     }
+    ethtool(
+        name,
+        &mut Value {
+            cmd: command,
+            data: value,
+        },
+    )
+}
+
+/// Feature names in bit order, which differs between kernels, and the
+/// active features, one word per 32 of them.
+fn features(name: &str) -> Result<(Vec<String>, Vec<u32>)> {
     #[repr(C)]
-    struct Request {
-        name: [u8; 16],
-        data: *mut libc::c_void,
-        _pad: [u8; 16],
+    struct SetInfo {
+        cmd: u32,
+        reserved: u32,
+        mask: u64,
+        count: u32,
     }
-    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-    let mut value = Value {
-        cmd: command,
-        data: value,
+    let mut info = SetInfo {
+        cmd: ETHTOOL_GSSET_INFO,
+        reserved: 0,
+        mask: 1 << ETH_SS_FEATURES,
+        count: 0,
     };
-    let mut request = Request {
-        name: [0; 16],
-        data: (&raw mut value).cast(),
-        _pad: [0; 16],
+    ethtool(name, &mut info)?;
+    ensure!(info.mask != 0, "no feature names");
+    let count = info.count as usize;
+    // struct ethtool_gstrings: cmd, string_set, len, then the names.
+    let mut strings = vec![0u32; 3 + count * ETH_GSTRING_LEN / 4];
+    strings[..3].copy_from_slice(&[ETHTOOL_GSTRINGS, ETH_SS_FEATURES, count as u32]);
+    ethtool(name, &mut strings[..])?;
+    let bytes: Vec<u8> = strings[3..].iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let names = bytes
+        .chunks(ETH_GSTRING_LEN)
+        .map(|s| {
+            let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+            String::from_utf8_lossy(&s[..end]).into_owned()
+        })
+        .collect();
+    // struct ethtool_gfeatures: cmd, size, then per 32 features available,
+    // requested, active and never_changed.
+    let blocks = count.div_ceil(32);
+    let mut get = vec![0u32; 2 + blocks * 4];
+    get[..2].copy_from_slice(&[ETHTOOL_GFEATURES, blocks as u32]);
+    ethtool(name, &mut get[..])?;
+    let active = (0..blocks).map(|b| get[2 + b * 4 + 2]).collect();
+    Ok((names, active))
+}
+fn is_active(active: &[u32], bit: u32) -> bool {
+    active
+        .get(bit as usize / 32)
+        .is_some_and(|word| word & (1 << (bit % 32)) != 0)
+}
+
+/// Bit numbers of the `wanted` features active on `name`.
+fn active_features(name: &str, wanted: &[&str]) -> Result<Vec<u32>> {
+    let (names, active) = features(name)?;
+    Ok((0..names.len() as u32)
+        .filter(|&bit| wanted.contains(&names[bit as usize].as_str()) && is_active(&active, bit))
+        .collect())
+}
+
+fn set_features(name: &str, bits: &[u32], on: bool) -> Result<()> {
+    let Some(&last) = bits.iter().max() else {
+        return Ok(());
     };
-    ensure!(name.len() < 16, "interface name too long");
-    request.name[..name.len()].copy_from_slice(name.as_bytes());
-    let rc = unsafe { libc::ioctl(socket.as_raw_fd(), SIOCETHTOOL as _, &raw mut request) };
-    ensure!(rc == 0, "ethtool: {}", io::Error::last_os_error());
+    let blocks = last as usize / 32 + 1;
+    // struct ethtool_sfeatures: cmd, size, then per 32 features valid and
+    // requested.
+    let mut set = vec![0u32; 2 + blocks * 2];
+    set[..2].copy_from_slice(&[ETHTOOL_SFEATURES, blocks as u32]);
+    for &bit in bits {
+        let block = 2 + bit as usize / 32 * 2;
+        set[block] |= 1 << (bit % 32);
+        if on {
+            set[block + 1] |= 1 << (bit % 32);
+        }
+    }
+    ethtool(name, &mut set[..])?;
+    let (_, active) = features(name)?;
+    ensure!(
+        bits.iter().all(|&bit| is_active(&active, bit) == on),
+        "the kernel kept the previous setting"
+    );
     Ok(())
 }
 

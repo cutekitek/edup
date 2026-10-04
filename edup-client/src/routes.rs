@@ -5,8 +5,8 @@ mod platform;
 #[path = "routes_windows.rs"]
 mod platform;
 #[cfg(all(target_os = "linux", feature = "xdp"))]
-pub use platform::{Gateway, device_prefixes};
-pub use platform::{PhysicalRoute, ensure_available, set_dns};
+pub use platform::{Gateway, device_prefixes, dnsmasq_upstreams, interface_prefixes};
+pub use platform::{PhysicalRoute, clean_dns, ensure_available, set_dns};
 
 use crate::{config::Action, ipset::Prefix, routing::Plan};
 use anyhow::{Result, bail};

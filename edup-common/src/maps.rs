@@ -195,15 +195,44 @@ pub struct ClientConfig {
     /// Largest inner packet carried through the tunnel.
     pub mtu: u16,
     pub v6: u8,
-    pub _pad: u8,
-    /// Physical interface: XDP ingress, TC egress and tunnel output.
+    /// Client mode of traffic without a mode in its mark: the client's own.
+    pub local_mode: u8,
+    /// Physical interface: XDP or TC ingress, TC egress and tunnel output.
     pub physical: u32,
     /// Veth whose disabled offloads make the kernel finish GSO and checksums.
     pub segment: u32,
     /// TUN device carrying route lookups to userspace.
     pub tun: u32,
-    /// Marks packets re-injected by userspace and encapsulated packets.
+    /// Marks packets re-injected by userspace and encapsulated packets;
+    /// compared without the client mode byte.
     pub mark: u32,
+    /// Veth end that TC decapsulation sends inner packets into, so that its
+    /// peer merges them with GRO before the stack; 0 passes them up directly.
+    pub inbound: u32,
+    /// MAC address of that peer.
+    pub inbound_mac: [u8; 6],
+    pub _pad: [u8; 2],
+}
+
+/// Keystream words: one past `MAX_KS_WORDS` for a partial last word.
+pub const KEYSTREAM_WORDS: usize = crate::wire::MAX_KS_WORDS as usize + 1;
+
+/// The client's `KEYSTREAM` value. The stream is the same for every packet,
+/// so userspace computes it once instead of eBPF per word.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Keystream {
+    pub words: [u64; KEYSTREAM_WORDS],
+}
+impl Keystream {
+    pub fn new(key: &crate::wire::Key) -> Self {
+        let seed = crate::wire::ks_seed(key);
+        let mut words = [0; KEYSTREAM_WORDS];
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = crate::wire::ks_word(seed, i as u32);
+        }
+        Self { words }
+    }
 }
 
 /// `ROUTES` values, keyed by a 16-byte destination address.
@@ -227,8 +256,21 @@ pub const HEARTBEAT_TIMEOUT_NS: u64 = 2 * SEC;
 pub const LOOKUP_WAIT_NS: u64 = SEC / 2;
 /// until it is asked again.
 pub const LOOKUP_RETRY_NS: u64 = 5 * SEC;
-/// Default packet mark; any value works if policy routing does not use it.
-pub const CLIENT_MARK: u32 = 0x6564_7570;
+/// Default packet mark, without the client mode byte; any value works if
+/// policy routing does not use it.
+pub const CLIENT_MARK: u32 = 0x0064_7570;
+
+/// Client modes: `CLIENTS` values, and the top byte of packet marks set by
+/// the classifier on LAN interfaces. Zero in a mark means "not classified".
+pub const MODE_RULES: u8 = 1;
+pub const MODE_PROXY: u8 = 2;
+pub const MODE_BYPASS: u8 = 3;
+pub const MODE_SHIFT: u32 = 24;
+pub const MODE_MASK: u32 = 0xff << MODE_SHIFT;
+/// Prefixes of the client table; LPM tries allocate only used entries.
+pub const CLIENT_ENTRIES: u32 = 65_536;
+/// Specific routes of the physical interface.
+pub const SYSTEM_ENTRIES: u32 = 4096;
 
 /// Indexes of the per-CPU client counters in `CLIENT_STATS`.
 pub mod client_stat {
@@ -242,7 +284,9 @@ pub mod client_stat {
     pub const DROP_TOO_BIG: u32 = 7;
     pub const DROP_BAD: u32 = 8;
     pub const DROP_ADJUST: u32 = 9;
-    pub const COUNT: u32 = 10;
+    /// A proxied client's packet without the masqueraded local source.
+    pub const FOREIGN_SOURCE: u32 = 10;
+    pub const COUNT: u32 = 11;
 
     pub const NAMES: [&str; COUNT as usize] = [
         "xdp_proxy",
@@ -255,6 +299,7 @@ pub mod client_stat {
         "xdp_drop_too_big",
         "xdp_drop_bad",
         "xdp_drop_adjust",
+        "xdp_foreign_source",
     ];
 }
 
@@ -279,6 +324,6 @@ const _: () = {
     assert!(core::mem::size_of::<NatOutKey>() == 8);
     assert!(core::mem::size_of::<NatInKey>() == 4);
     assert!(core::mem::size_of::<NatInVal>() == 16);
-    assert!(core::mem::size_of::<ClientConfig>() == 80);
+    assert!(core::mem::size_of::<ClientConfig>() == 96);
     assert!(core::mem::size_of::<RouteEntry>() == 16);
 };

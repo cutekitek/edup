@@ -102,9 +102,32 @@ impl Action {
     }
 }
 
+/// Where a rule sends what it matches; `rules` only on `from` rules.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Target {
+    Proxy,
+    Bypass,
+    /// The destination rules decide.
+    Rules,
+}
+impl Target {
+    pub fn action(self) -> Option<Action> {
+        match self {
+            Self::Proxy => Some(Action::Proxy),
+            Self::Bypass => Some(Action::Bypass),
+            Self::Rules => None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRule {
+    /// Source prefixes (xdp mode): clients whose traffic `to` decides,
+    /// whatever its destination.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub from: Vec<Prefix>,
     /// CIDR prefixes or single addresses.
     #[serde(default, deserialize_with = "one_or_many")]
     pub ip: Vec<Prefix>,
@@ -119,9 +142,16 @@ pub struct RouteRule {
     pub domain_suffix: Vec<String>,
     #[serde(default, deserialize_with = "one_or_many")]
     pub domain_keyword: Vec<String>,
-    pub to: Action,
+    pub to: Target,
 }
 impl RouteRule {
+    pub fn is_client(&self) -> bool {
+        !self.from.is_empty()
+    }
+    /// The action of a destination rule.
+    pub fn action(&self) -> Action {
+        self.to.action().unwrap_or(Action::Proxy)
+    }
     pub fn domains(&self) -> Result<DomainMatcher> {
         let mut matcher = DomainMatcher::default();
         self.domain.iter().try_for_each(|d| matcher.add_domain(d))?;
@@ -144,14 +174,27 @@ pub struct Dns {
     /// Point the system resolver at the forwarder through the TUN interface.
     #[serde(default = "set_system")]
     pub set_system: bool,
+    /// Send the forwarder's queries to public `servers` through the tunnel,
+    /// whatever the routing rules say about their addresses.
+    #[serde(default)]
+    pub proxy: bool,
+    /// Forwarder port on the tunnel address. Another one avoids a resolver
+    /// that binds port 53 on every address, as OpenWrt's dnsmasq does.
+    #[serde(default = "dns_port")]
+    pub port: u16,
 }
 impl Default for Dns {
     fn default() -> Self {
         Self {
             servers: Vec::new(),
             set_system: true,
+            proxy: false,
+            port: dns_port(),
         }
     }
+}
+fn dns_port() -> u16 {
+    53
 }
 fn set_system() -> bool {
     true
@@ -306,13 +349,35 @@ impl Settings {
             );
         }
         self.address()?;
+        let mut destinations = false;
         for (i, rule) in self.routing.routes.iter().enumerate() {
             let domains = rule
                 .domains()
                 .with_context(|| format!("routing.routes[{i}]"))?;
+            let destination = !rule.ip.is_empty() || !rule.rules.is_empty() || !domains.is_empty();
+            if rule.is_client() {
+                ensure!(
+                    self.mode == Mode::Xdp,
+                    "routing.routes[{i}]: \"from\" needs mode \"xdp\""
+                );
+                ensure!(
+                    !destination,
+                    "routing.routes[{i}]: \"from\" cannot be combined with \"ip\", \"rules\" or domain items"
+                );
+                ensure!(
+                    !destinations,
+                    "routing.routes[{i}]: \"from\" rules must precede destination rules"
+                );
+                continue;
+            }
+            destinations = true;
             ensure!(
-                !rule.ip.is_empty() || !rule.rules.is_empty() || !domains.is_empty(),
-                "routing.routes[{i}] needs \"ip\", \"rules\" or a domain item"
+                destination,
+                "routing.routes[{i}] needs \"ip\", \"rules\", a domain item or \"from\""
+            );
+            ensure!(
+                rule.to != Target::Rules,
+                "routing.routes[{i}]: \"to\": \"rules\" needs \"from\""
             );
             for source in &rule.rules {
                 ensure!(
@@ -322,6 +387,7 @@ impl Settings {
                 );
             }
         }
+        ensure!(self.dns.port != 0, "dns.port must not be 0");
         for Upstream(server) in &self.dns.servers {
             ensure!(
                 !server.ip().is_unspecified() && server.port() != 0,
@@ -390,7 +456,7 @@ mod tests {
         assert_eq!(c.routing.default_route, Action::Proxy);
         assert_eq!(c.routing.routes.len(), 1);
         assert_eq!(c.routing.routes[0].ip.len(), 3);
-        assert_eq!(c.routing.routes[0].to, Action::Bypass);
+        assert_eq!(c.routing.routes[0].to, Target::Bypass);
         assert_eq!((c.mode, c.xdp_mode), (Mode::Tun, XdpMode::Auto));
     }
     #[test]
@@ -493,6 +559,45 @@ mod tests {
     }
 
     #[test]
+    fn client_rules() {
+        let config = |mode: &str, routes: &str| {
+            parse(&format!(
+                r#"{{{mode} "server": "192.0.2.1:7777", "user": 1, "password": "test", "routing": {{"routes": [{routes}]}}}}"#
+            ))
+        };
+        let xdp = r#""mode": "xdp","#;
+        let good = r#"{"from": "192.168.1.50", "to": "bypass"},
+            {"from": ["192.168.1.0/24", "fd00::/8"], "to": "rules"},
+            {"ip": "10.0.0.0/8", "to": "bypass"}"#;
+        let c = config(xdp, good).unwrap();
+        assert_eq!(
+            c.validate().is_ok(),
+            cfg!(all(target_os = "linux", feature = "xdp"))
+        );
+        assert!(c.routing.routes[0].is_client() && !c.routing.routes[2].is_client());
+        assert_eq!(c.routing.routes[1].to, Target::Rules);
+        assert_eq!(c.routing.routes[1].from.len(), 2);
+        // TUN mode has no client table.
+        assert!(config("", good).unwrap().validate().is_err());
+        assert!(config(xdp, r#"{"from": "192.168.1.0/33", "to": "proxy"}"#).is_err());
+        if cfg!(all(target_os = "linux", feature = "xdp")) {
+            for bad in [
+                r#"{"from": "192.168.1.50", "ip": "1.1.1.1", "to": "proxy"}"#,
+                r#"{"from": "192.168.1.50", "domain": "a.ru", "to": "proxy"}"#,
+                r#"{"ip": "1.1.1.1", "to": "rules"}"#,
+                r#"{"ip": "1.1.1.1", "to": "proxy"}, {"from": "192.168.1.50", "to": "bypass"}"#,
+                r#"{"from": [], "to": "bypass"}"#,
+            ] {
+                assert!(config(xdp, bad).unwrap().validate().is_err(), "{bad}");
+            }
+            config(xdp, r#"{"from": "192.168.1.0/24", "to": "proxy"}"#)
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn domain_rules_and_dns() {
         let c = parse(
             r#"{"server": "192.0.2.1:7777", "user": 1, "password": "test",
@@ -500,7 +605,8 @@ mod tests {
                 {"domain_suffix": ".ru", "domain": "example.ru", "to": "bypass"},
                 {"domain_keyword": "ads", "domain_suffix": [".cdn.example.com"], "to": "proxy"}
             ]},
-            "dns": {"servers": ["9.9.9.9", "[2620:fe::fe]:5353"], "set_system": false}}"#,
+            "dns": {"servers": ["9.9.9.9", "[2620:fe::fe]:5353"], "set_system": false,
+                    "port": 10053}}"#,
         )
         .unwrap();
         c.validate().unwrap();
@@ -517,10 +623,15 @@ mod tests {
             ]
         );
         assert!(!c.dns.set_system);
+        assert_eq!(c.dns.port, 10053);
         let defaults = cfg();
         assert!(defaults.dns.set_system);
+        assert_eq!(defaults.dns.port, 53);
+        assert!(!defaults.dns.proxy);
         assert_eq!(defaults.dns_servers()[0].to_string(), "1.1.1.1:53");
         assert!(parse(&EXAMPLE.replacen('{', r#"{"dns": {"servers": "dns.google"},"#, 1)).is_err());
+        let port_zero = EXAMPLE.replacen('{', r#"{"dns": {"port": 0},"#, 1);
+        assert!(parse(&port_zero).is_ok_and(|c| c.validate().is_err()));
     }
     #[test]
     fn invalid_configuration() {

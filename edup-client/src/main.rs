@@ -98,10 +98,13 @@ fn main() -> Result<()> {
             } else {
                 let rules = routing::resolve(&cfg)?;
                 let mut text = if cfg.mode == config::Mode::Xdp {
+                    let clients = routing::clients(&cfg);
+                    let family = ipset::Family::of(cfg.server.ip());
                     format!(
-                        "default {}, {} rules decided per destination by the XDP route cache",
+                        "default {}, {} destination rules decided per destination by the XDP route cache, {} client prefixes",
                         cfg.routing.default_route.name(),
-                        cfg.routing.routes.len(),
+                        rules.rules.len(),
+                        clients.entries(family).len(),
                     )
                 } else {
                     let plan = rules.plan();
@@ -137,7 +140,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(all(target_os = "linux", feature = "xdp"))]
-        Command::Run if cfg.mode == config::Mode::Xdp => xdp::run(cfg),
+        Command::Run if cfg.mode == config::Mode::Xdp => xdp::run(cfg, &cli.config),
         Command::Run => run(cfg),
         Command::Credentials => unreachable!(),
     }
@@ -158,6 +161,8 @@ fn shutdown_signal() -> Result<(Arc<AtomicBool>, Arc<InterruptEvent>)> {
 fn run(cfg: config::Settings) -> Result<()> {
     let (stop, event) = shutdown_signal()?;
     routes::ensure_available(&cfg.interface)?;
+    // Not while another client runs: its TUN interface would exist.
+    routes::clean_dns()?;
     // Rule-sets download before any route can capture the traffic.
     let rules = routing::resolve(&cfg)?;
     let plan = rules.plan();
@@ -178,6 +183,7 @@ fn run(cfg: config::Settings) -> Result<()> {
     socket.set_write_timeout(Some(Duration::from_millis(200)))?;
     let socket = udp::Transport::new(socket, cfg.offload).context("configure UDP offload")?;
     let address = tunnel_address(&cfg)?;
+    let forwarder = std::net::SocketAddr::new(address, cfg.dns.port);
     let tun = create_device(&cfg)?;
     let index = tun.if_index()?;
     let routes = Mutex::new(routes::Routes::install(
@@ -186,10 +192,11 @@ fn run(cfg: config::Settings) -> Result<()> {
         cfg.server.ip(),
         &plan,
     )?);
+    let mut _system_dns = None;
     let dns = if rules.uses_dns() {
-        let listener = dns::Listener::bind(address)?;
+        let listener = dns::Listener::bind(forwarder)?;
         if cfg.dns.set_system {
-            routes::set_dns(&cfg.interface, index, address)?;
+            _system_dns = routes::set_dns(&cfg.interface, index, forwarder)?;
         }
         Some((
             dns::Forwarder::new(&rules, &routes, cfg.dns_servers()),
@@ -208,7 +215,7 @@ fn run(cfg: config::Settings) -> Result<()> {
         cfg.mtu,
         routes.lock().unwrap().len(),
         if dns.is_some() {
-            format!(", DNS={}", std::net::SocketAddr::new(address, 53))
+            format!(", DNS={forwarder}")
         } else {
             String::new()
         }
