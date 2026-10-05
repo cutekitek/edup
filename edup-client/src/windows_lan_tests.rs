@@ -8,12 +8,14 @@ fn lan_roundtrip() -> Result<()> {
     let mut cfg: config::Settings =
         edup_common::json::parse(include_str!("../../config/client.example.json"))
             .map_err(anyhow::Error::msg)?;
-    cfg.server = std::env::var("EDUP_LAN_PEER")
+    cfg.servers[0].address = std::env::var("EDUP_LAN_PEER")
         .context("set EDUP_LAN_PEER")?
         .parse()?;
     cfg.interface = "edup-lan-test".into();
-    cfg.routing = Default::default();
-    cfg.routing.default_route = config::Action::Bypass;
+    cfg.routing = config::Routing {
+        default_route: config::Action::Direct,
+        routes: Vec::new(),
+    };
     cfg.keepalive_secs = 1;
     cfg.offload = std::env::var("EDUP_TEST_OFFLOAD").as_deref() != Ok("false");
     cfg.wintun_dll = Some(
@@ -26,16 +28,8 @@ fn lan_roundtrip() -> Result<()> {
     ps(
         "if (@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object DestinationPrefix -eq '198.18.0.1/32').Count) {throw 'test destination already has a host route'}",
     );
-    let physical = routes::PhysicalRoute::discover(cfg.server.ip())?;
-    let raw = UdpSocket::bind((physical.source(), 0))?;
-    raw.connect(cfg.server)?;
-    raw.set_read_timeout(Some(Duration::from_millis(200)))?;
-    raw.set_write_timeout(Some(Duration::from_millis(200)))?;
-    socket2::SockRef::from(&raw).set_recv_buffer_size(4 * 1024 * 1024)?;
-    socket2::SockRef::from(&raw).set_send_buffer_size(1024 * 1024)?;
-    let socket = udp::Transport::new(raw, cfg.offload)?;
-    let tun = create_device(&cfg)?;
-    let index = tun.if_index()?;
+    let (tunnel, _) = Tunnel::open(&cfg, 0)?;
+    let index = tunnel.tun.if_index()?;
     struct Route(u32);
     impl Drop for Route {
         fn drop(&mut self) {
@@ -49,13 +43,12 @@ fn lan_roundtrip() -> Result<()> {
     ps(&format!(
         "New-NetRoute -DestinationPrefix 198.18.0.1/32 -InterfaceIndex {index} -NextHop 0.0.0.0 -RouteMetric 42762 -PolicyStore ActiveStore | Out-Null; $until=(Get-Date).AddSeconds(8); while (!(Get-NetIPAddress -InterfaceIndex {index} -AddressFamily IPv4 | Where-Object AddressState -eq Preferred)) {{if ((Get-Date) -gt $until) {{throw 'IPv4 address not ready'}}; Start-Sleep -Milliseconds 100}}"
     ));
-    let key = derive_key(&cfg.password);
-    let counts = Counters::default();
+    let counts = &tunnel.counts;
     let stop = AtomicBool::new(false);
     let event = InterruptEvent::new()?;
     let result = std::thread::scope(|scope| -> Result<()> {
-        let tx = scope.spawn(|| send_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event));
-        let rx = scope.spawn(|| receive_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event));
+        let tx = scope.spawn(|| send_loop(&tunnel, &cfg, &stop, &event));
+        let rx = scope.spawn(|| receive_loop(&tunnel, &cfg, &stop, &event));
         let test = (|| -> Result<()> {
             let app = UdpSocket::bind((cfg.address()?, 0))?;
             socket2::SockRef::from(&app).set_recv_buffer_size(4 * 1024 * 1024)?;
@@ -158,10 +151,9 @@ fn lan_roundtrip() -> Result<()> {
         );
         test.and(sent).and(received)
     });
-    counts.report();
-    report_offload(&socket);
+    tunnel.report();
     drop(route);
-    drop(tun);
+    drop(tunnel);
     routes::ensure_available(&cfg.interface)?;
     result
 }

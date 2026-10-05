@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-edup
-PKG_VERSION:=0.1.0
+PKG_VERSION:=0.2.0
 PKG_RELEASE:=2
 PKG_LICENSE:=MIT OR Apache-2.0
 
@@ -14,7 +14,7 @@ define Package/luci-app-edup
   SUBMENU:=3. Applications
   TITLE:=LuCI pages for the edup VPN client
   PKGARCH:=all
-  EXTRA_DEPENDS:=luci-base (>=0), edup-client (>=0.1.0)
+  EXTRA_DEPENDS:=luci-base (>=0), edup-client (>=0.2.0)
 endef
 
 define Package/luci-app-edup/description

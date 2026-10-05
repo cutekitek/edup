@@ -10,6 +10,14 @@
 			"uci": { "edup": true }
 		}
 	},
+	"admin/services/edup/servers": {
+		"title": "Servers",
+		"order": 5,
+		"action": {
+			"type": "view",
+			"path": "edup/servers"
+		}
+	},
 	"admin/services/edup/devices": {
 		"title": "Devices",
 		"order": 10,

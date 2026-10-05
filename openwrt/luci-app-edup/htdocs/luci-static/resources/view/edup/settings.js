@@ -46,7 +46,7 @@ return view.extend({
 
 	render([ pid, text ]) {
 		const m = new form.Map('edup', _('edup VPN: settings'),
-			_('The tunnel runs in eBPF on the WAN interface. LAN devices need masquerading on the WAN zone (the default) and flow offloading must stay off.'));
+			_('The tunnels run in eBPF on the WAN interface. LAN devices need masquerading on the WAN zone (the default) and flow offloading must stay off.'));
 
 		let s = m.section(form.NamedSection, 'main', 'edup', _('Service'));
 		let o = s.option(form.DummyValue, '_status', _('Status'));
@@ -67,20 +67,7 @@ return view.extend({
 			]);
 		};
 
-		o = s.option(form.Flag, 'enabled', _('Enable'));
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'server', _('Server'), _('Address and port, e.g. 192.0.2.1:7777.'));
-		o.rmempty = false;
-		o.validate = (section_id, value) =>
-			/^(\[[0-9A-Fa-f:.]+\]|[0-9.]+):[0-9]+$/.test(value) || _('Expecting address:port');
-
-		o = s.option(form.Value, 'user', _('User ID'), _('A signed 64-bit integer; "edup-client credentials" creates one.'));
-		o.rmempty = false;
-		o.validate = (section_id, value) => /^-?[0-9]+$/.test(value) || _('Expecting an integer');
-
-		o = s.option(form.Value, 'password', _('Password'));
-		o.password = true;
+		o = s.option(form.Flag, 'enabled', _('Enable'), _('Tunnel servers are on the Servers page.'));
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'mtu', _('MTU'),
@@ -115,8 +102,11 @@ return view.extend({
 			_('Upstream resolvers for domain rules. Default: 1.1.1.1 and 8.8.8.8.'));
 		o.datatype = 'or(ipaddr("nomask"),ipaddrport(1))';
 
-		o = s.option(form.Flag, 'dns_proxy', _('Send DNS queries through the VPN'),
-			_('The forwarder for domain rules reaches these DNS servers through the tunnel, whatever the traffic rules say. When off, their addresses follow the traffic rules. Servers on local networks are always reached directly.'));
+		o = s.option(form.ListValue, 'dns_proxy', _('Send DNS queries through'),
+			_('The forwarder for domain rules reaches these DNS servers through this server\'s tunnel, whatever the traffic rules say. Servers on local networks are always reached directly.'));
+		o.value('0', _('Follow the traffic rules'));
+		uci.sections('edup', 'server').forEach((s) => o.value(s['.name'], _('VPN: %s').format(s['.name'])));
+		o.default = '0';
 		o.rmempty = false;
 
 		o = s.option(form.Flag, 'dns_set_system', _('Use for dnsmasq'),

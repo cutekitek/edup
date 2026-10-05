@@ -10,11 +10,13 @@ const callHostHints = rpc.declare({
 	expect: { '': {} }
 });
 
-const MODES = [
-	[ 'all', _('Always VPN') ],
-	[ 'rules', _('Traffic rules') ],
-	[ 'off', _('No VPN') ]
-];
+// Each server, then the traffic rules or no VPN.
+function modes(o) {
+	uci.sections('edup', 'server').forEach((s) =>
+		o.value(s['.name'], _('Always via %s').format(s['.name'])));
+	o.value('rules', _('Traffic rules'));
+	o.value('direct', _('No VPN'));
+}
 
 return view.extend({
 	load() {
@@ -26,14 +28,14 @@ return view.extend({
 
 	render([hosts]) {
 		const m = new form.Map('edup', _('edup VPN: devices'),
-			_('Choose for each device of the local network whether its traffic goes through the VPN: always, as the traffic rules decide, or never. ' +
+			_('Choose for each device of the local network where its traffic goes: always through one server, as the traffic rules decide, or never through the VPN. ' +
 			  'Devices are matched by IPv4 address, so give them a static DHCP lease. ' +
-			  'Changes to this page apply without interrupting the tunnel; connections a change moves to another path restart.'));
+			  'Changes to this page apply without interrupting the tunnels; connections a change moves to another path restart.'));
 
 		let s = m.section(form.NamedSection, 'main', 'edup');
 		let o = s.option(form.ListValue, 'lan_mode', _('Other devices'),
 			_('Devices of the LAN that are not listed below.'));
-		MODES.forEach(([ value, title ]) => o.value(value, title));
+		modes(o);
 		o.default = 'rules';
 
 		s = m.section(form.GridSection, 'device', _('Devices'),
@@ -71,8 +73,8 @@ return view.extend({
 		};
 
 		o = s.option(form.ListValue, 'mode', _('VPN'));
-		MODES.forEach(([ value, title ]) => o.value(value, title));
-		o.default = 'all';
+		modes(o);
+		o.default = uci.sections('edup', 'server')[0]?.['.name'] ?? 'rules';
 		o.editable = true;
 
 		return m.render();

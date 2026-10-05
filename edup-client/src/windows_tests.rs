@@ -44,7 +44,7 @@ fn queued_wintun_bursts_are_drained() {
     ps(
         "if (@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object DestinationPrefix -eq '203.0.113.7/32').Count) {throw 'test destination already has a host route'}",
     );
-    let tun = create_device(&cfg).unwrap();
+    let tun = create_device(&cfg, 0).unwrap();
     let index = tun.if_index().unwrap();
     ps(&format!(
         "New-NetRoute -DestinationPrefix 203.0.113.7/32 -InterfaceIndex {index} -NextHop 0.0.0.0 -PolicyStore ActiveStore | Out-Null"
@@ -104,7 +104,7 @@ fn ipv4_mtu_below_ipv6_minimum() {
     );
     cfg.validate().unwrap();
     routes::ensure_available(&cfg.interface).unwrap();
-    let tun = create_device(&cfg).unwrap();
+    let tun = create_device(&cfg, 0).unwrap();
     assert_eq!(tun.mtu().unwrap(), 1200);
     assert!(tun.mtu_v6().unwrap() >= 1280);
     drop(tun);
@@ -127,15 +127,8 @@ fn live_offload() -> Result<()> {
     ps(
         "foreach ($p in @('1.1.1.1/32','104.16.0.35/32')) {if (@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object DestinationPrefix -eq $p).Count) {throw 'live test destination already has a host route'}}",
     );
-    let physical = routes::PhysicalRoute::discover(cfg.server.ip())?;
-    let socket = UdpSocket::bind((physical.source(), 0))?;
-    socket.connect(cfg.server)?;
-    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
-    socket.set_write_timeout(Some(Duration::from_millis(200)))?;
-    socket2::SockRef::from(&socket).set_recv_buffer_size(4 * 1024 * 1024)?;
-    let socket = udp::Transport::new(socket, true)?;
-    let tun = create_device(&cfg)?;
-    let index = tun.if_index()?;
+    let (tunnel, _) = Tunnel::open(&cfg, 0)?;
+    let index = tunnel.tun.if_index()?;
     struct LiveRoutes(u32);
     impl Drop for LiveRoutes {
         fn drop(&mut self) {
@@ -149,14 +142,11 @@ fn live_offload() -> Result<()> {
     ps(&format!(
         "foreach ($p in @('1.1.1.1/32','104.16.0.35/32')) {{New-NetRoute -DestinationPrefix $p -InterfaceIndex {index} -NextHop 0.0.0.0 -RouteMetric 42761 -PolicyStore ActiveStore | Out-Null}}; $until=(Get-Date).AddSeconds(8); while (!(Get-NetIPAddress -InterfaceIndex {index} -AddressFamily IPv4 | Where-Object AddressState -eq Preferred)) {{if ((Get-Date) -gt $until) {{throw 'IPv4 address not ready'}}; Start-Sleep -Milliseconds 100}}"
     ));
-    let key = derive_key(&cfg.password);
-    let counts = Counters::default();
     let stop = AtomicBool::new(false);
     let event = InterruptEvent::new()?;
     let result = std::thread::scope(|scope| -> Result<()> {
-        let send = scope.spawn(|| send_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event));
-        let receive =
-            scope.spawn(|| receive_loop(&tun, &socket, &cfg, &key, &counts, &stop, &event));
+        let send = scope.spawn(|| send_loop(&tunnel, &cfg, &stop, &event));
+        let receive = scope.spawn(|| receive_loop(&tunnel, &cfg, &stop, &event));
         let test = (|| -> Result<()> {
             let dns = UdpSocket::bind((cfg.address()?, 0))?;
             dns.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -225,10 +215,9 @@ fn live_offload() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("receiver panicked"))?;
         test.and(tx).and(rx)
     });
-    counts.report();
-    report_offload(&socket);
+    tunnel.report();
     drop(route_guard);
-    drop(tun);
+    drop(tunnel);
     routes::ensure_available(&cfg.interface)?;
     result
 }

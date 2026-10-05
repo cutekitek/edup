@@ -4,19 +4,21 @@
 //!   source in the permanent client table `CLIENTS` and stores the client's
 //!   mode in the top byte of the packet mark, which survives forwarding and
 //!   masquerading up to the egress hook.
-//! - `edup_egress*` (TC egress, physical interface) applies the mode: bypassed
-//!   clients continue unchanged, proxied clients go to the segmentation veth.
-//!   Other traffic looks up each destination in `ROUTES`: bypassed packets
-//!   continue unchanged; proxied packets go to the veth; unknown destinations
-//!   go through the TUN device to userspace, which stores the route and
-//!   re-injects the packet. Without a recent userspace heartbeat, or while a
-//!   lookup stays unanswered, packets follow the standard route.
+//! - `edup_egress*` (TC egress, physical interface) applies the mode: direct
+//!   clients continue unchanged, clients of a server go to the segmentation
+//!   veth. Other traffic looks up each destination in `ROUTES`: direct
+//!   packets continue unchanged; packets for a server go to the veth; unknown
+//!   destinations go through the TUN device to userspace, which stores the
+//!   route and re-injects the packet. Without a recent userspace heartbeat,
+//!   or while a lookup stays unanswered, packets follow the standard route.
+//!   Packets sent into the veth carry their server's mode in the mark.
 //! - `edup_encap*` (TC ingress, veth peer) receives segmented packets with
-//!   complete checksums, encapsulates them and sends them to the server.
+//!   complete checksums, encapsulates them for the server their mark names
+//!   and sends them there.
 //! - `edup_ingress*` (XDP, Ethernet physical interface) and `edup_decap*_l3`
 //!   (TC ingress, physical interface without a link-layer header, such as
 //!   PPPoE) decapsulate server packets into ordinary packets for the local
-//!   stack.
+//!   stack. `TUNNELS` names the server by the datagram's source.
 //!
 //! `_l3` programs serve interfaces whose packets start at the IP header.
 #![no_std]
@@ -35,34 +37,40 @@ use aya_ebpf::{
         bpf_skb_change_tail, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
     },
     macros::{classifier, map, xdp},
-    maps::{Array, LpmTrie, LruHashMap, PerCpuArray, lpm_trie::Key as Prefix},
+    maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, lpm_trie::Key as Prefix},
     programs::{TcContext, XdpContext},
 };
 use edup_common::{
     csum,
     maps::{client_stat as stat, *},
-    wire::{self, Key},
+    wire,
 };
 use packet::*;
 
 #[map]
 static CLIENT_CONFIG: Array<ClientConfig> = Array::with_max_entries(1, 0);
+/// Servers by index.
+#[map]
+static SERVERS: Array<ServerConfig> = Array::with_max_entries(MAX_SERVERS, 0);
+/// Server address and port -> server index.
+#[map]
+static TUNNELS: HashMap<TunnelKey, u32> = HashMap::with_max_entries(MAX_SERVERS, 0);
 #[map]
 static ROUTES: LruHashMap<[u8; 16], RouteEntry> = LruHashMap::with_max_entries(ROUTE_ENTRIES, 0);
-/// Source prefix -> MODE_PROXY or MODE_BYPASS.
+/// Source prefix -> MODE_DIRECT or a server's mode.
 #[map]
 static CLIENTS: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(CLIENT_ENTRIES, 0);
-/// Destinations that keep the standard route even for proxied clients, and
-/// need no lookup: the networks of the host's interfaces, such as a LAN or a
-/// point-to-point peer, and the host's own addresses.
+/// Destinations that keep the standard route even for clients of a server,
+/// and need no lookup: the networks of the host's interfaces, such as a LAN
+/// or a point-to-point peer, the host's own addresses and the servers.
 #[map]
 static SYSTEM: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(SYSTEM_ENTRIES, 0);
 /// CLOCK_MONOTONIC nanoseconds of the last userspace iteration.
 #[map]
 static HEARTBEAT: Array<u64> = Array::with_max_entries(1, 0);
-/// The key's stream words, filled by userspace.
+/// Each server's key stream words by server index, filled by userspace.
 #[map]
-static KEYSTREAM: Array<Keystream> = Array::with_max_entries(1, 0);
+static KEYSTREAM: Array<Keystream> = Array::with_max_entries(MAX_SERVERS, 0);
 #[map]
 static CLIENT_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(stat::COUNT, 0);
 
@@ -159,6 +167,17 @@ fn alive(now: u64) -> bool {
     heartbeat != 0 && now.saturating_sub(heartbeat) < HEARTBEAT_TIMEOUT_NS
 }
 
+/// Replaces the mark's mode byte, keeping the other bits. One 32-bit store:
+/// the verifier rejects narrower context writes, which LLVM would otherwise
+/// use for the changed byte.
+#[inline(always)]
+fn set_mode(ctx: &TcContext, mode: u32) {
+    unsafe {
+        let mark = core::ptr::addr_of_mut!((*ctx.skb.skb).mark);
+        core::ptr::write_volatile(mark, *mark & !MODE_MASK | mode << MODE_SHIFT);
+    }
+}
+
 /// Stores the source's client mode in the mark's top byte, keeping the other
 /// bits; sources missing from the table follow the destination rules. For
 /// those, unknown destinations are looked up here, before routing and
@@ -170,23 +189,20 @@ fn classify<const V6: bool, const L2: usize>(ctx: &TcContext) -> Result<i32, ()>
     let Some((src, dst)) = addresses::<V6, L2>(ctx)? else {
         return Ok(TC_ACT_UNSPEC);
     };
-    let mode = CLIENTS
+    let mut mode = CLIENTS
         .get(Prefix::new(bits::<V6>(), src))
         .copied()
         .unwrap_or(MODE_RULES as u32);
-    // One 32-bit store: the verifier rejects narrower context writes, which
-    // LLVM would otherwise use for the changed byte.
-    unsafe {
-        let mark = core::ptr::addr_of_mut!((*ctx.skb.skb).mark);
-        core::ptr::write_volatile(mark, *mark & !MODE_MASK | mode << MODE_SHIFT);
-    }
-    // Local and on-link destinations need no route.
-    if mode != MODE_RULES as u32
-        || cfg.physical == 0
-        || multicast::<V6>(&dst)
-        || dst == cfg.server
-        || SYSTEM.get(Prefix::new(bits::<V6>(), dst)).is_some()
+    // Local and on-link destinations and the servers need no route: direct,
+    // so that the egress hook passes them without a cache lookup.
+    if mode == MODE_RULES as u32
+        && cfg.physical != 0
+        && (multicast::<V6>(&dst) || SYSTEM.get(Prefix::new(bits::<V6>(), dst)).is_some())
     {
+        mode = MODE_DIRECT as u32;
+    }
+    set_mode(ctx, mode);
+    if mode != MODE_RULES as u32 || cfg.physical == 0 {
         return Ok(TC_ACT_UNSPEC);
     }
     let now = unsafe { bpf_ktime_get_ns() };
@@ -231,7 +247,8 @@ fn lookup(cfg: &ClientConfig) -> Result<i32, ()> {
 
 /// What the route cache says about a destination.
 enum Cached {
-    Proxy,
+    /// Through the tunnel of the server with this mode.
+    Server(u8),
     Bypass,
     /// Ask userspace; a pending request is recorded.
     Lookup,
@@ -257,9 +274,7 @@ fn cached(dst: &[u8; 16], now: u64, ask: bool) -> Cached {
     };
     let route = unsafe { core::ptr::read_volatile(entry) };
     match route.action {
-        ROUTE_BYPASS => Cached::Bypass,
-        ROUTE_PROXY => Cached::Proxy,
-        _ => {
+        ROUTE_PENDING => {
             let age = now.saturating_sub(route.since_ns);
             if !ask || (LOOKUP_WAIT_NS..LOOKUP_RETRY_NS).contains(&age) {
                 return Cached::Fallback;
@@ -273,14 +288,25 @@ fn cached(dst: &[u8; 16], now: u64, ask: bool) -> Cached {
             }
             Cached::Lookup
         }
+        action if action == MODE_DIRECT as u32 => Cached::Bypass,
+        action => Cached::Server(action as u8),
     }
 }
 
-/// Sends a proxied packet into the segmentation veth, which carries Ethernet
-/// frames: interfaces without a link-layer header get an empty one.
+/// Sends a packet into the segmentation veth, marked with the mode of the
+/// server whose tunnel carries it. The veth carries Ethernet frames:
+/// interfaces without a link-layer header get an empty one.
 #[inline(always)]
-fn proxy<const V6: bool, const L2: usize>(ctx: &TcContext, cfg: &ClientConfig) -> Result<i32, ()> {
+fn proxy<const V6: bool, const L2: usize>(
+    ctx: &TcContext,
+    cfg: &ClientConfig,
+    mode: u8,
+) -> Result<i32, ()> {
+    if server_of(mode).is_none() {
+        return fallback();
+    }
     count(stat::PROXY);
+    set_mode(ctx, mode as u32);
     if L2 == 0 {
         if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH as u32, 0) } != 0 {
             count(stat::DROP_ADJUST);
@@ -303,24 +329,27 @@ fn egress<const V6: bool, const L2: usize>(ctx: &TcContext) -> Result<i32, ()> {
     if cfg.physical == 0 {
         return Ok(TC_ACT_UNSPEC);
     }
+    // The tunnels' own packets always take the standard route.
+    let mark = unsafe { (*ctx.skb.skb).mark };
+    if mark == cfg.mark | (MODE_TUNNEL as u32) << MODE_SHIFT {
+        return Ok(TC_ACT_UNSPEC);
+    }
     let Some((src, dst)) = addresses::<V6, L2>(ctx)? else {
         return Ok(TC_ACT_UNSPEC);
     };
-    // The tunnel itself and anything else for the server always take the
-    // standard route.
-    if multicast::<V6>(&dst) || dst == cfg.server {
+    if multicast::<V6>(&dst) {
         return Ok(TC_ACT_UNSPEC);
     }
     // Userspace re-injects packets after storing their route; they follow
     // the destination rules. Classified packets were looked up before.
-    let mark = unsafe { (*ctx.skb.skb).mark };
     let reinjected = mark & !MODE_MASK == cfg.mark;
     let (mode, classified) = match (mark >> MODE_SHIFT) as u8 {
         _ if reinjected => (MODE_RULES, false),
-        mode @ (MODE_RULES | MODE_PROXY | MODE_BYPASS) => (mode, true),
+        mode @ (MODE_RULES | MODE_DIRECT) => (mode, true),
+        mode if server_of(mode).is_some() => (mode, true),
         _ => (cfg.local_mode, false),
     };
-    if mode == MODE_BYPASS {
+    if mode == MODE_DIRECT {
         count(stat::BYPASS);
         return Ok(TC_ACT_UNSPEC);
     }
@@ -328,7 +357,8 @@ fn egress<const V6: bool, const L2: usize>(ctx: &TcContext) -> Result<i32, ()> {
     if !alive(now) {
         return fallback();
     }
-    if mode == MODE_PROXY {
+    if server_of(mode).is_some() {
+        // Includes the servers themselves.
         if SYSTEM.get(Prefix::new(bits::<V6>(), dst)).is_some() {
             count(stat::BYPASS);
             return Ok(TC_ACT_UNSPEC);
@@ -338,7 +368,7 @@ fn egress<const V6: bool, const L2: usize>(ctx: &TcContext) -> Result<i32, ()> {
             count(stat::FOREIGN_SOURCE);
             return Ok(TC_ACT_UNSPEC);
         }
-        return proxy::<V6, L2>(ctx, cfg);
+        return proxy::<V6, L2>(ctx, cfg, mode);
     }
     // Other local addresses keep the standard route.
     if src != cfg.local {
@@ -351,7 +381,7 @@ fn egress<const V6: bool, const L2: usize>(ctx: &TcContext) -> Result<i32, ()> {
             count(stat::BYPASS);
             Ok(TC_ACT_UNSPEC)
         }
-        Cached::Proxy => proxy::<V6, L2>(ctx, cfg),
+        Cached::Server(mode) => proxy::<V6, L2>(ctx, cfg, mode),
         Cached::Lookup => lookup(cfg),
         Cached::Fallback => fallback(),
     }
@@ -380,10 +410,16 @@ pub fn edup_encap6(ctx: TcContext) -> i32 {
 }
 
 /// The segmentation veth delivers single packets with complete checksums;
-/// only the egress program sends traffic into it.
+/// only the egress program sends traffic into it, marked with its server.
 #[inline(always)]
 fn encap<const V6: bool>(ctx: &TcContext) -> Result<i32, u32> {
     let cfg = CLIENT_CONFIG.get(0).ok_or(stat::DROP_BAD)?;
+    let mode = (unsafe { (*ctx.skb.skb).mark } >> MODE_SHIFT) as u8;
+    let index = server_of(mode).ok_or(stat::DROP_BAD)?;
+    let server = SERVERS.get(index).ok_or(stat::DROP_BAD)?;
+    if server.port_be == 0 {
+        return Err(stat::DROP_BAD);
+    }
     let len = ctx.len() as usize;
     if len > ETH + cfg.mtu as usize {
         return Err(stat::DROP_TOO_BIG);
@@ -441,16 +477,16 @@ fn encap<const V6: bool>(ctx: &TcContext) -> Result<i32, u32> {
     {
         return Err(stat::DROP_ADJUST);
     }
-    write_outer::<V6, _>(ctx, cfg, outer)?;
-    write(ctx, ETH + hlen + 8, cfg.user.to_be())?;
+    write_outer::<V6, _>(ctx, cfg, server, outer)?;
+    write(ctx, ETH + hlen + 8, server.user.to_be())?;
     write(
         ctx,
         ETH + hlen + 16,
         if V6 { wire::TYPE_IPV6 } else { wire::TYPE_DATA },
     )?;
-    let sum = xor::<true, _>(ctx, ETH + hlen + 16, outer - hlen - 16)?;
+    let sum = xor::<true, _>(ctx, ETH + hlen + 16, outer - hlen - 16, index)?;
     finish_outer_checksum(ctx, outer, hlen, sum)?;
-    ctx.set_mark(cfg.mark);
+    ctx.set_mark(cfg.mark | (MODE_TUNNEL as u32) << MODE_SHIFT);
     count(stat::TX_TUNNEL);
     // The kernel routes the outer packet and resolves its next hop.
     Ok(unsafe { bpf_redirect_neigh(cfg.physical, core::ptr::null_mut(), 0, 0) } as i32)
@@ -491,19 +527,21 @@ fn pack_ipv6(ctx: &TcContext) -> Result<(), u32> {
 fn write_outer<const V6: bool, C: Packet>(
     ctx: &C,
     cfg: &ClientConfig,
+    server: &ServerConfig,
     len: usize,
 ) -> Result<(), u32> {
     let hlen = if V6 { 40 } else { 20 };
+    let address = &server.address;
     if V6 {
         write(ctx, ETH, 0x60000000u32.to_be())?;
         write(ctx, ETH + 4, ((len - 40) as u16).to_be())?;
         write(ctx, ETH + 6, IPPROTO_UDP)?;
         write(ctx, ETH + 7, 64u8)?;
         write(ctx, ETH + 8, cfg.local)?;
-        write(ctx, ETH + 24, cfg.server)?;
+        write(ctx, ETH + 24, *address)?;
     } else {
         let src = u32::from_ne_bytes([cfg.local[0], cfg.local[1], cfg.local[2], cfg.local[3]]);
-        let dst = u32::from_ne_bytes([cfg.server[0], cfg.server[1], cfg.server[2], cfg.server[3]]);
+        let dst = u32::from_ne_bytes([address[0], address[1], address[2], address[3]]);
         let words = [
             0x0045u16.to_le(),
             (len as u16).to_be(),
@@ -520,7 +558,7 @@ fn write_outer<const V6: bool, C: Packet>(
         write(ctx, ETH + 10, csum::ipv4_header(&words))?;
     }
     write(ctx, ETH + hlen, cfg.local_port_be)?;
-    write(ctx, ETH + hlen + 2, cfg.server_port_be)?;
+    write(ctx, ETH + hlen + 2, server.port_be)?;
     write(ctx, ETH + hlen + 4, ((len - hlen) as u16).to_be())?;
     write(ctx, ETH + hlen + 6, 0u16)
 }
@@ -529,8 +567,13 @@ fn write_outer<const V6: bool, C: Packet>(
 // sum, high 32 bits hold a nonzero drop reason. Rust's Result<u64, u32> must
 // not cross a BPF function-call boundary.
 #[inline(always)]
-fn xor<const CHECKSUM: bool, C: Packet>(ctx: &C, offset: usize, len: usize) -> Result<u64, u32> {
-    let result = xor_word::<CHECKSUM, C>(ctx, offset, len);
+fn xor<const CHECKSUM: bool, C: Packet>(
+    ctx: &C,
+    offset: usize,
+    len: usize,
+    server: u32,
+) -> Result<u64, u32> {
+    let result = xor_word::<CHECKSUM, C>(ctx, offset, len, server);
     if result >> 32 != 0 {
         Err((result >> 32) as u32)
     } else {
@@ -570,12 +613,18 @@ fn store64(ptr: usize, value: u64) {
     };
 }
 
-/// XORs `len` bytes at `offset` with the keystream. This loop is most of the
-/// datapath's work: per word one table load, packet load and packet store.
+/// XORs `len` bytes at `offset` with the server's keystream. This loop is
+/// most of the datapath's work: per word one table load, packet load and
+/// packet store.
 #[inline(never)]
-fn xor_word<const CHECKSUM: bool, C: Packet>(ctx: &C, offset: usize, len: usize) -> u64 {
+fn xor_word<const CHECKSUM: bool, C: Packet>(
+    ctx: &C,
+    offset: usize,
+    len: usize,
+    server: u32,
+) -> u64 {
     let result = (|| -> Result<u64, u32> {
-        let ks = KEYSTREAM.get(0).ok_or(stat::DROP_BAD)?;
+        let ks = KEYSTREAM.get(server).ok_or(stat::DROP_BAD)?;
         if len > wire::MAX_KS_WORDS as usize * 8 {
             return Err(stat::DROP_TOO_BIG);
         }
@@ -685,10 +734,10 @@ fn ingress_result<const V6: bool>(ctx: &XdpContext) -> Result<u32, u32> {
     if read::<u16, _>(ctx, 12) != Ok(ether::<V6>()) {
         return PASS;
     }
-    let Some(outer) = tunnel::<V6, ETH, _>(ctx, cfg)? else {
+    let Some((outer, server)) = tunnel::<V6, ETH, _>(ctx, cfg)? else {
         return PASS;
     };
-    decap::<V6, ETH, _>(ctx, cfg, &outer)?;
+    decap::<V6, ETH, _>(ctx, cfg, &outer, server)?;
     trim(ctx, ETH + outer.len)?;
     let mac = read::<[u8; 12], _>(ctx, 0)?;
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, overhead::<V6>() as i32) } != 0 {
@@ -742,10 +791,10 @@ fn ingress_l3_result<const V6: bool>(ctx: &TcContext) -> Result<i32, u32> {
         return PASS;
     }
     // Pulling invalidates packet pointers; check the header again.
-    let Some(outer) = tunnel::<V6, 0, _>(ctx, cfg)? else {
+    let Some((outer, server)) = tunnel::<V6, 0, _>(ctx, cfg)? else {
         return PASS;
     };
-    decap::<V6, 0, _>(ctx, cfg, &outer)?;
+    decap::<V6, 0, _>(ctx, cfg, &outer, server)?;
     if len as usize > outer.len
         && unsafe { bpf_skb_change_tail(ctx.skb.skb, outer.len as u32, 0) } != 0
     {
@@ -782,14 +831,14 @@ fn ingress_l3_result<const V6: bool>(ctx: &TcContext) -> Result<i32, u32> {
     Ok(unsafe { bpf_redirect(cfg.inbound, 0) } as i32)
 }
 
-/// The outer IP header of tunnel data from the server, if this is one.
-/// Other packets pass unchanged, including KEEPALIVE replies for the
-/// client's UDP socket.
+/// The outer IP header of tunnel data from a server and the server's index,
+/// if this is one. Other packets pass unchanged, including KEEPALIVE replies
+/// for the client's UDP socket.
 #[inline(always)]
 fn tunnel<const V6: bool, const L2: usize, C: Packet>(
     ctx: &C,
     cfg: &ClientConfig,
-) -> Result<Option<Ip>, u32> {
+) -> Result<Option<(Ip, u32)>, u32> {
     if cfg.physical == 0 {
         return Ok(None);
     }
@@ -804,47 +853,53 @@ fn tunnel<const V6: bool, const L2: usize, C: Packet>(
     {
         return Ok(None);
     }
-    let addresses = if V6 {
-        read::<[u8; 16], _>(ctx, L2 + 8)? == cfg.server
-            && read::<[u8; 16], _>(ctx, L2 + 24)? == cfg.local
+    // Every tunnel ends at the client's socket.
+    let mut key = TunnelKey::default();
+    let local = if V6 {
+        key.address = read::<[u8; 16], _>(ctx, L2 + 8)?;
+        read::<[u8; 16], _>(ctx, L2 + 24)? == cfg.local
     } else {
-        read::<[u8; 4], _>(ctx, L2 + 12)?
-            == [cfg.server[0], cfg.server[1], cfg.server[2], cfg.server[3]]
-            && read::<[u8; 4], _>(ctx, L2 + 16)?
-                == [cfg.local[0], cfg.local[1], cfg.local[2], cfg.local[3]]
+        key.address[..4].copy_from_slice(&read::<[u8; 4], _>(ctx, L2 + 12)?);
+        read::<[u8; 4], _>(ctx, L2 + 16)?
+            == [cfg.local[0], cfg.local[1], cfg.local[2], cfg.local[3]]
     };
-    if !addresses
-        || read::<u16, _>(ctx, L2 + hlen)? != cfg.server_port_be
-        || read::<u16, _>(ctx, L2 + hlen + 2)? != cfg.local_port_be
-        || u16::from_be(read::<u16, _>(ctx, L2 + hlen + 4)?) as usize != outer.len - hlen
-        || i64::from_be(read::<i64, _>(ctx, L2 + hlen + 8)?) != cfg.user
+    if !local || read::<u16, _>(ctx, L2 + hlen + 2)? != cfg.local_port_be {
+        return Ok(None);
+    }
+    key.port_be = read::<u16, _>(ctx, L2 + hlen)?;
+    let Some(&index) = (unsafe { TUNNELS.get(&key) }) else {
+        return Ok(None);
+    };
+    let (Some(server), Some(stream)) = (SERVERS.get(index), KEYSTREAM.get(index)) else {
+        return Ok(None);
+    };
+    if u16::from_be(read::<u16, _>(ctx, L2 + hlen + 4)?) as usize != outer.len - hlen
+        || i64::from_be(read::<i64, _>(ctx, L2 + hlen + 8)?) != server.user
         || outer.len - hlen - 16 > wire::MAX_KS_WORDS as usize * 8
     {
         return Ok(None);
     }
-    let seed = wire::ks_seed(&Key {
-        k0: cfg.key0,
-        k1: cfg.key1,
-    });
-    let typ = read::<u8, _>(ctx, L2 + hlen + 16)? ^ wire::ks_word(seed, 0) as u8;
+    let typ = read::<u8, _>(ctx, L2 + hlen + 16)? ^ stream.words[0] as u8;
     if typ != if V6 { wire::TYPE_IPV6 } else { wire::TYPE_DATA } {
         return Ok(None);
     }
-    Ok(Some(outer))
+    Ok(Some((outer, index)))
 }
 
-/// Decrypts and unpacks tunnel data in place; the inner packet then starts
-/// `overhead` bytes later. Errors after decryption starts drop the packet.
+/// Decrypts and unpacks tunnel data from server `server` in place; the inner
+/// packet then starts `overhead` bytes later. Errors after decryption starts
+/// drop the packet.
 #[inline(always)]
 fn decap<const V6: bool, const L2: usize, C: Packet>(
     ctx: &C,
     cfg: &ClientConfig,
     outer: &Ip,
+    server: u32,
 ) -> Result<(), u32> {
     let hlen = if V6 { 40 } else { 20 };
     let header = hlen + 8 + wire::HDR_LEN;
     let overhead = overhead::<V6>();
-    xor::<false, _>(ctx, L2 + hlen + 16, outer.len - hlen - 16)?;
+    xor::<false, _>(ctx, L2 + hlen + 16, outer.len - hlen - 16, server)?;
     if V6 {
         unpack_ipv6(ctx, L2 + header, outer.len - header, &cfg.local)?;
     } else {

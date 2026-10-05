@@ -183,28 +183,24 @@ pub mod stat {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClientConfig {
-    pub key0: u64,
-    pub key1: u64,
-    pub user: i64,
     /// Source address of proxied traffic: the physical route's address.
     pub local: [u8; 16],
-    pub server: [u8; 16],
-    pub server_port_be: u16,
-    /// Port of the client's UDP socket, shared by keepalives and the datapath.
+    /// Port of the client's UDP socket, shared by keepalives and every tunnel.
     pub local_port_be: u16,
-    /// Largest inner packet carried through the tunnel.
+    /// Largest inner packet carried through a tunnel.
     pub mtu: u16,
     pub v6: u8,
     /// Client mode of traffic without a mode in its mark: the client's own.
     pub local_mode: u8,
+    pub _pad0: [u8; 2],
     /// Physical interface: XDP or TC ingress, TC egress and tunnel output.
     pub physical: u32,
     /// Veth whose disabled offloads make the kernel finish GSO and checksums.
     pub segment: u32,
     /// TUN device carrying route lookups to userspace.
     pub tun: u32,
-    /// Marks packets re-injected by userspace and encapsulated packets;
-    /// compared without the client mode byte.
+    /// Marks packets re-injected by userspace and, with mode byte
+    /// MODE_TUNNEL, the tunnels' own packets; compared without the mode byte.
     pub mark: u32,
     /// Veth end that TC decapsulation sends inner packets into, so that its
     /// peer merges them with GRO before the stack; 0 passes them up directly.
@@ -214,10 +210,33 @@ pub struct ClientConfig {
     pub _pad: [u8; 2],
 }
 
+/// One tunnel server: `SERVERS` element by server index.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServerConfig {
+    pub user: i64,
+    pub address: [u8; 16],
+    pub port_be: u16,
+    pub _pad: [u8; 6],
+}
+
+/// `TUNNELS` key: a server's address and port, whose datagrams carry its
+/// tunnel to the client's socket.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TunnelKey {
+    pub address: [u8; 16],
+    pub port_be: u16,
+    pub _pad: [u8; 2],
+}
+
+/// Servers one XDP mode client tunnels to at most.
+pub const MAX_SERVERS: u32 = 32;
+
 /// Keystream words: one past `MAX_KS_WORDS` for a partial last word.
 pub const KEYSTREAM_WORDS: usize = crate::wire::MAX_KS_WORDS as usize + 1;
 
-/// The client's `KEYSTREAM` value. The stream is the same for every packet,
+/// A server's `KEYSTREAM` value. The stream is the same for every packet,
 /// so userspace computes it once instead of eBPF per word.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -241,13 +260,12 @@ impl Keystream {
 pub struct RouteEntry {
     /// ROUTE_PENDING: time of the lookup request.
     pub since_ns: u64,
+    /// ROUTE_PENDING, MODE_DIRECT or a server's mode.
     pub action: u32,
     pub _pad: u32,
 }
 
 pub const ROUTE_PENDING: u32 = 0;
-pub const ROUTE_PROXY: u32 = 1;
-pub const ROUTE_BYPASS: u32 = 2;
 
 pub const ROUTE_ENTRIES: u32 = 131_072;
 /// Userspace refreshes `HEARTBEAT`; older heartbeats mean it stopped responding.
@@ -262,9 +280,24 @@ pub const CLIENT_MARK: u32 = 0x0064_7570;
 
 /// Client modes: `CLIENTS` values, and the top byte of packet marks set by
 /// the classifier on LAN interfaces. Zero in a mark means "not classified".
+/// MODE_DIRECT and the server modes are also routes in `ROUTES`, and the
+/// egress hook marks packets it sends into a tunnel with the server's mode.
 pub const MODE_RULES: u8 = 1;
-pub const MODE_PROXY: u8 = 2;
-pub const MODE_BYPASS: u8 = 3;
+pub const MODE_DIRECT: u8 = 2;
+/// Server `i`'s tunnel: `MODE_SERVER + i`.
+pub const MODE_SERVER: u8 = 3;
+/// The tunnels' own packets: encapsulated packets and keepalives.
+pub const MODE_TUNNEL: u8 = 0xff;
+/// The server index of a mode, if it names one.
+#[inline(always)]
+pub const fn server_of(mode: u8) -> Option<u32> {
+    let index = mode.wrapping_sub(MODE_SERVER) as u32;
+    if index < MAX_SERVERS {
+        Some(index)
+    } else {
+        None
+    }
+}
 pub const MODE_SHIFT: u32 = 24;
 pub const MODE_MASK: u32 = 0xff << MODE_SHIFT;
 /// Prefixes of the client table; LPM tries allocate only used entries.
@@ -314,6 +347,8 @@ mod pod {
     unsafe impl aya::Pod for NatInKey {}
     unsafe impl aya::Pod for NatInVal {}
     unsafe impl aya::Pod for ClientConfig {}
+    unsafe impl aya::Pod for ServerConfig {}
+    unsafe impl aya::Pod for TunnelKey {}
     unsafe impl aya::Pod for RouteEntry {}
 }
 
@@ -324,6 +359,9 @@ const _: () = {
     assert!(core::mem::size_of::<NatOutKey>() == 8);
     assert!(core::mem::size_of::<NatInKey>() == 4);
     assert!(core::mem::size_of::<NatInVal>() == 16);
-    assert!(core::mem::size_of::<ClientConfig>() == 96);
+    assert!(core::mem::size_of::<ClientConfig>() == 52);
+    assert!(core::mem::size_of::<ServerConfig>() == 32);
+    assert!(core::mem::size_of::<TunnelKey>() == 20);
+    assert!(MODE_SERVER as u32 + MAX_SERVERS <= MODE_TUNNEL as u32);
     assert!(core::mem::size_of::<RouteEntry>() == 16);
 };

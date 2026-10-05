@@ -3,17 +3,23 @@
 		"description": "Grant access to the edup VPN configuration",
 		"read": {
 			"file": {
-				"/sbin/logread": [ "exec" ]
+				"/sbin/logread": [ "exec" ],
+				"/etc/edup/rule-sets": [ "list" ]
 			},
 			"ubus": {
-				"file": [ "exec" ],
+				"file": [ "exec", "list" ],
 				"luci-rpc": [ "getHostHints" ],
 				"service": [ "list" ]
 			},
 			"uci": [ "edup" ]
 		},
 		"write": {
+			"cgi-io": [ "upload" ],
+			"file": {
+				"/etc/edup/rule-sets/*": [ "write" ]
+			},
 			"ubus": {
+				"file": [ "remove" ],
 				"rc": [ "init" ]
 			},
 			"uci": [ "edup" ]

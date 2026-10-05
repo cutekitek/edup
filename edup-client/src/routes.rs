@@ -18,22 +18,24 @@ const MAX_HOSTS: usize = 65536;
 pub struct Routes {
     table: platform::Table,
     created: Vec<platform::Route>,
-    tunnel: u32,
+    /// TUN interface index of each server.
+    tunnels: Vec<u32>,
     ipv6: bool,
     gateway: Option<platform::Gateway>,
     /// Host routes for DNS answers, with their current direction.
     hosts: HashMap<IpAddr, (Action, platform::Route)>,
 }
 impl Routes {
-    /// Installs the server exception, then bypass routes, then tunnel routes, so
-    /// traffic never loops into the tunnel while the table is incomplete.
+    /// Installs the server exceptions, then bypass routes, then tunnel
+    /// routes, so traffic never loops into a tunnel while the table is
+    /// incomplete. `physical` and `tunnels` are by server index.
     pub fn install(
-        physical: &PhysicalRoute,
-        index: u32,
-        server: IpAddr,
+        physical: &[PhysicalRoute],
+        tunnels: &[u32],
+        servers: &[IpAddr],
         plan: &Plan,
     ) -> Result<Self> {
-        for prefix in plan.tunnel.iter().filter(|p| p.len <= 1) {
+        for prefix in plan.tunnel.iter().flatten().filter(|p| p.len <= 1) {
             if platform::existing(prefix)? {
                 bail!("route {prefix} already exists; stop the other tunnel or route manually");
             }
@@ -41,23 +43,27 @@ impl Routes {
         let mut guard = Self {
             table: platform::Table::new()?,
             created: Vec::new(),
-            tunnel: index,
-            ipv6: server.is_ipv6(),
+            tunnels: tunnels.to_vec(),
+            ipv6: servers[0].is_ipv6(),
             gateway: None,
             hosts: HashMap::new(),
         };
-        let host = Prefix::host(server);
-        // A pre-existing server route belongs to its owner and stays untouched.
-        if plan.server_exception && !platform::existing(&host)? {
-            guard.add(physical.route(host), true)?;
+        for &i in &plan.exceptions {
+            let host = Prefix::host(servers[i]);
+            // A pre-existing server route belongs to its owner and stays untouched.
+            if !platform::existing(&host)? {
+                guard.add(physical[i].route(host), true)?;
+            }
         }
         for &prefix in &plan.bypass {
             // Identical bypass routes may survive a crash; leave them to their owner.
             let route = guard.gateway()?.route(prefix);
             guard.add(route, false)?;
         }
-        for &prefix in &plan.tunnel {
-            guard.add(platform::Route::tunnel(prefix, index), true)?;
+        for (prefixes, &index) in plan.tunnel.iter().zip(tunnels) {
+            for &prefix in prefixes {
+                guard.add(platform::Route::tunnel(prefix, index), true)?;
+            }
         }
         Ok(guard)
     }
@@ -75,8 +81,8 @@ impl Routes {
         }
         Ok(self.gateway.as_ref().unwrap())
     }
-    /// Sends `ip` through the tunnel or the default route with a host route,
-    /// replacing an earlier host route in the other direction.
+    /// Sends `ip` through a tunnel or the default route with a host route,
+    /// replacing an earlier host route in another direction.
     pub fn host(&mut self, ip: IpAddr, action: Action) -> Result<()> {
         match self.hosts.get(&ip) {
             Some((current, _)) if *current == action => return Ok(()),
@@ -93,8 +99,8 @@ impl Routes {
         }
         let prefix = Prefix::host(ip);
         let route = match action {
-            Action::Proxy => platform::Route::tunnel(prefix, self.tunnel),
-            Action::Bypass => self.gateway()?.route(prefix),
+            Action::Server(i) => platform::Route::tunnel(prefix, self.tunnels[i]),
+            Action::Direct => self.gateway()?.route(prefix),
         };
         // An identical route from elsewhere already sends it the same way.
         if self.table.add(&route)? {

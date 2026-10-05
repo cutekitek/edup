@@ -155,6 +155,7 @@ fn isolated(ipv6: bool) {
             .args(["--ignored", "--exact", "echo_peer", "--nocapture"])
             .env("EDUP_PEER_DIR", &dir)
             .env("EDUP_PEER_IPV6", if ipv6 { "1" } else { "0" })
+            .env("EDUP_PEER_SECOND", "1")
             .spawn()
             .unwrap(),
     );
@@ -267,10 +268,10 @@ fn isolated(ipv6: bool) {
     fs::write(
         dir.join("client.json"),
         config
-            .replace("\"default_route\": \"proxy\"", "\"default_route\": \"bypass\"")
+            .replace("\"default_route\": \"main\"", "\"default_route\": \"direct\"")
             .replace(
-                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"bypass\" }",
-                &format!("{{ \"ip\": [\"{added}\", \"{taken}\"], \"to\": \"proxy\" }}"),
+                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"direct\" }",
+                &format!("{{ \"ip\": [\"{added}\", \"{taken}\"], \"to\": \"main\" }}"),
             ),
     )
     .unwrap();
@@ -301,6 +302,7 @@ fn isolated(ipv6: bool) {
     assert!(ip(&["route", "show", "exact", "192.0.2.1/32"]).is_empty());
 
     dns_rules(&dir, &config, ipv6);
+    two_servers(&dir, &config, ipv6, false);
 
     // An identical bypass route, e.g. left by a crashed client, keeps its owner.
     if !ipv6 {
@@ -511,19 +513,124 @@ fn echo_peer() {
         ]);
         ip(&["link", "set", "edup-gre0", "up"]);
     }
-    let socket = UdpSocket::bind(if ipv6 {
+    let bind = |address: &str| {
+        let socket = UdpSocket::bind(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        socket
+    };
+    let first = bind(if ipv6 {
         "[2001:db8:1::1]:7777"
     } else if gre {
         "198.18.0.1:7777"
     } else {
         "192.0.2.1:7777"
-    })
-    .unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
+    });
+    // A second server on another address and port, with its own user and key.
+    let second = (std::env::var("EDUP_PEER_SECOND").as_deref() == Ok("1")).then(|| {
+        if gre {
+            ip(&["addr", "add", "198.18.0.3/32", "dev", "lo"]);
+            bind("198.18.0.3:7778")
+        } else if ipv6 {
+            ip(&[
+                "addr",
+                "add",
+                "2001:db8:1::4/64",
+                "dev",
+                "edup-peer0",
+                "nodad",
+            ]);
+            bind("[2001:db8:1::4]:7778")
+        } else {
+            ip(&["addr", "add", "192.0.2.4/24", "dev", "edup-peer0"]);
+            bind("192.0.2.4:7778")
+        }
+    });
     fs::write(dir.join("peer-ready"), "").unwrap();
-    let key = derive_key("replace-this-password");
+    thread::scope(|scope| {
+        if let Some(socket) = second {
+            let dir = &dir;
+            scope
+                .spawn(move || serve(dir, socket, "second-password", SECOND_USER, "-second", ipv6));
+        }
+        serve(&dir, first, "replace-this-password", USER, "", ipv6);
+    });
+}
+
+const USER: i64 = 4829017365182049271;
+const SECOND_USER: i64 = 77;
+fn tunnelled_by(dir: &Path, suffix: &str, address: &str) -> bool {
+    fs::read_to_string(dir.join(format!("tunnelled{suffix}")))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l == address)
+}
+
+/// Two servers: a rule sends one destination through the second server's
+/// tunnel, everything else still goes through the first.
+fn two_servers(dir: &Path, config: &str, ipv6: bool, xdp: bool) {
+    let (main, second) = if ipv6 {
+        ("2001:db8:2::51", "2001:db8:2::50")
+    } else {
+        ("203.0.113.51", "203.0.113.50")
+    };
+    let server = if ipv6 {
+        "[2001:db8:1::4]:7778"
+    } else {
+        "192.0.2.4:7778"
+    };
+    let private =
+        "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"direct\" }";
+    fs::write(
+        dir.join("client.json"),
+        config
+            // Closes the first server's entry; its brace closes the second's.
+            .replace(
+                "\"password\": \"replace-this-password\"",
+                &format!(
+                    "\"password\": \"replace-this-password\" }}, {{ \"tag\": \"second\", \"server\": \"{server}\", \"user\": {SECOND_USER}, \"password\": \"second-password\""
+                ),
+            )
+            .replace(
+                private,
+                &format!("{{ \"ip\": \"{second}\", \"to\": \"second\" }}, {private}"),
+            ),
+    )
+    .unwrap();
+    let mut client = client(dir);
+    started(dir, &mut client);
+    let log = fs::read_to_string(dir.join("client.log")).unwrap();
+    if xdp {
+        assert!(log.contains("servers=main"), "{log}");
+    } else {
+        assert!(log.contains("edup1") && log.contains("(second)"), "{log}");
+        assert!(ip(&["route", "get", main]).contains("dev edup0"));
+        assert!(ip(&["route", "get", second]).contains("dev edup1"));
+        let address = server.rsplit_once(':').unwrap().0.trim_matches(['[', ']']);
+        assert!(ip(&["route", "get", address]).contains("dev edup-test0"));
+    }
+    for address in [main, second] {
+        checked("ping", &["-n", "-c", "2", "-W", "3", address]);
+    }
+    assert!(tunnelled_by(dir, "", main) && !tunnelled_by(dir, "-second", main));
+    assert!(tunnelled_by(dir, "-second", second) && !tunnelled_by(dir, "", second));
+    wait_for(|| {
+        fs::read_to_string(dir.join("keepalives-second"))
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            >= 1
+    });
+    stop(&mut client);
+    assert!(!Path::new("/sys/class/net/edup1").exists());
+    fs::write(dir.join("client.json"), config).unwrap();
+}
+
+/// Echoes packets tunnelled to one server back to the client; files named
+/// with `suffix` record its keepalives and tunnelled destinations.
+fn serve(dir: &Path, socket: UdpSocket, password: &str, user: i64, suffix: &str, ipv6: bool) {
+    let key = derive_key(password);
     let mut buf = [0u8; 2048];
     let mut keepalives = 0;
     let mut injected = false;
@@ -543,7 +650,7 @@ fn echo_peer() {
             Err(e) => panic!("{e}"),
         };
         let opened = wire::open(&key, &mut buf[..len]).unwrap();
-        assert_eq!(opened.user, 4829017365182049271);
+        assert_eq!(opened.user, user);
         let mut packet = [0u8; 2048];
         let ip_len = if opened.typ == wire::TYPE_KEEPALIVE {
             0
@@ -561,7 +668,11 @@ fn echo_peer() {
             && packet[if ipv6 { 48 } else { 28 }] == 0x6b;
         if opened.typ == wire::TYPE_KEEPALIVE {
             keepalives += 1;
-            fs::write(dir.join("keepalives"), keepalives.to_string()).unwrap();
+            fs::write(
+                dir.join(format!("keepalives{suffix}")),
+                keepalives.to_string(),
+            )
+            .unwrap();
             if !injected {
                 socket.send_to(&[0; 3], from).unwrap();
                 let mut wrong = [0; wire::HDR_LEN];
@@ -578,7 +689,7 @@ fn echo_peer() {
             };
             if tunnelled.insert(destination) {
                 let list: String = tunnelled.iter().map(|a| format!("{a}\n")).collect();
-                fs::write(dir.join("tunnelled"), list).unwrap();
+                fs::write(dir.join(format!("tunnelled{suffix}")), list).unwrap();
             }
             if ip[0] >> 4 == 6 {
                 assert_eq!(l4_checksum6(ip), 0, "IPv6 TUN checksum");
@@ -645,17 +756,11 @@ fn echo_peer() {
             }
         }
         let len = if opened.typ == wire::TYPE_KEEPALIVE {
-            wire::seal(&key, opened.typ, 4829017365182049271, &mut buf[..len]);
+            wire::seal(&key, opened.typ, user, &mut buf[..len]);
             len
         } else {
             buf[wire::HDR_LEN..wire::HDR_LEN + ip_len].copy_from_slice(&packet[..ip_len]);
-            wire::seal_data(
-                &key,
-                4829017365182049271,
-                &mut buf[..wire::HDR_LEN + ip_len],
-                false,
-            )
-            .unwrap()
+            wire::seal_data(&key, user, &mut buf[..wire::HDR_LEN + ip_len], false).unwrap()
         };
         // Generic XDP sees GSO packets from a veth peer unsegmented; a
         // server's XDP_TX sends separate datagrams.
@@ -733,9 +838,9 @@ fn dns_rules(dir: &Path, config: &str, ipv6: bool) {
         dir.join("client.json"),
         config
             .replace(
-                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"bypass\" }",
+                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"direct\" }",
                 &format!(
-                    "{{ \"domain\": \"proxy.test\", \"to\": \"proxy\" }}, {{ \"ip\": \"{range}\", \"to\": \"bypass\" }}, {{ \"domain_suffix\": \".bypass.test\", \"to\": \"bypass\" }}"
+                    "{{ \"domain\": \"proxy.test\", \"to\": \"main\" }}, {{ \"ip\": \"{range}\", \"to\": \"direct\" }}, {{ \"domain_suffix\": \".bypass.test\", \"to\": \"direct\" }}"
                 ),
             )
             .replace(
@@ -926,6 +1031,7 @@ fn isolated_xdp(ipv6: bool) {
             .args(["--ignored", "--exact", "echo_peer", "--nocapture"])
             .env("EDUP_PEER_DIR", &dir)
             .env("EDUP_PEER_IPV6", if ipv6 { "1" } else { "0" })
+            .env("EDUP_PEER_SECOND", "1")
             .env("EDUP_PEER_ADDRESSES", peer_addresses)
             .env("EDUP_PEER_GSO", if ipv6 { "0" } else { "1" })
             .spawn()
@@ -1037,6 +1143,7 @@ fn isolated_xdp(ipv6: bool) {
     if !ipv6 {
         xdp_dns_rules(&dir, &config);
     }
+    two_servers(&dir, &config, ipv6, true);
 
     // SIGKILL leaves the veth pair behind; the next client replaces it.
     let mut crashed = client(&dir);
@@ -1118,6 +1225,7 @@ fn isolated_xdp_router() {
             .args(["--ignored", "--exact", "echo_peer", "--nocapture"])
             .env("EDUP_PEER_DIR", &dir)
             .env("EDUP_PEER_IPV6", "0")
+            .env("EDUP_PEER_SECOND", "1")
             .env("EDUP_PEER_ADDRESSES", peer_addresses)
             .env("EDUP_PEER_GSO", "0")
             .env("EDUP_PEER_GRE", "1")
@@ -1255,6 +1363,42 @@ fn isolated_xdp_router() {
     // Without the client, every client takes the standard route again.
     lan_ping("192.168.77.2", "203.0.113.78");
 
+    // Two servers: devices and destinations name the server by tag.
+    fs::write(
+        dir.join("client.json"),
+        format!(
+            r#"{{"mode": "xdp", "servers": [
+              {{ "tag": "nl", "server": "198.18.0.1:7777", "user": {USER}, "password": "replace-this-password" }},
+              {{ "tag": "de", "server": "198.18.0.3:7778", "user": {SECOND_USER}, "password": "second-password" }}],
+            "tunnel_ip": "10.66.0.7", "mtu": 1400, "keepalive_secs": 1,
+            "routing": {{"default_route": "nl", "routes": [
+              {{ "from": "192.168.77.2", "to": "de" }},
+              {{ "from": "192.168.77.3", "to": "direct" }},
+              {{ "from": "192.168.77.0/24", "to": "rules" }},
+              {{ "ip": "203.0.113.92", "to": "de" }}
+            ]}}}}"#
+        ),
+    )
+    .unwrap();
+    let mut router = client(&dir);
+    started(&dir, &mut router);
+    lan_ping("192.168.77.2", "203.0.113.90");
+    lan_ping("192.168.77.4", "203.0.113.91");
+    lan_ping("192.168.77.4", "203.0.113.92");
+    lan_ping("192.168.77.3", "203.0.113.78");
+    ping("203.0.113.93");
+    stop(&mut router);
+    for (address, main, second) in [
+        ("203.0.113.90", false, true),
+        ("203.0.113.91", true, false),
+        ("203.0.113.92", false, true),
+        ("203.0.113.78", false, false),
+        ("203.0.113.93", true, false),
+    ] {
+        assert_eq!(tunnelled_by(&dir, "", address), main, "{address}");
+        assert_eq!(tunnelled_by(&dir, "-second", address), second, "{address}");
+    }
+
     fs::write(dir.join("stop"), "").unwrap();
     drop(_peer);
     println!("router clients, live reload and a link without Ethernet headers passed");
@@ -1297,8 +1441,8 @@ fn xdp_dns_rules(dir: &Path, config: &str) {
         dir.join("client.json"),
         config
             .replace(
-                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"bypass\" }",
-                "{ \"domain\": \"proxy.test\", \"to\": \"proxy\" }, { \"ip\": \"198.51.100.0/24\", \"to\": \"bypass\" }",
+                "{ \"ip\": [\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"], \"to\": \"direct\" }",
+                "{ \"domain\": \"proxy.test\", \"to\": \"main\" }, { \"ip\": \"198.51.100.0/24\", \"to\": \"direct\" }",
             )
             .replace(
                 "\"offload\": true,",

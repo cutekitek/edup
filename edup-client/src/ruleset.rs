@@ -434,6 +434,33 @@ pub mod tests {
         set.contains(key(ip.parse().unwrap()))
     }
 
+    #[test]
+    fn files_load_relative_to_the_configuration_or_absolute() {
+        let dir = std::env::temp_dir().join(format!("edup-ruleset-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("lists")).unwrap();
+        let data = srs(1, &[rule(&[ip_item(&["203.0.113.0/24"])], false)]);
+        std::fs::write(dir.join("lists").join("test.srs"), &data).unwrap();
+        let absolute = dir.join("lists").join("test.srs");
+        for (source, base) in [
+            ("lists/test.srs", dir.as_path()),
+            (absolute.to_str().unwrap(), Path::new("elsewhere")),
+        ] {
+            let rules = load(source, base).unwrap();
+            assert!(
+                has(rules.set(crate::ipset::Family::V4), "203.0.113.9"),
+                "{source}"
+            );
+        }
+        let missing = load("lists/missing.srs", &dir).err().unwrap();
+        assert!(
+            format!("{missing:#}").contains("missing.srs"),
+            "{missing:#}"
+        );
+        // Local files are never cached.
+        assert!(!dir.join("rule-sets").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// domain/domain_suffix item from keys in sing's unreversed form.
     pub fn domain_item(keys: &[&str]) -> Vec<u8> {
         let (leaves, bitmap, labels) = crate::domain::tests::succinct(keys);

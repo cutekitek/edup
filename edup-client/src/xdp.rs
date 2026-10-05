@@ -1,15 +1,15 @@
 //! Linux `"mode": "xdp"`: eBPF programs on the physical interface carry the
-//! tunnel (see edup-ebpf-client) and keep a route per destination address.
-//! Userspace installs no routes. It answers route lookups for destinations
-//! the cache does not know yet, which arrive as packets through the TUN
-//! device, re-injects those packets, sends KEEPALIVE and runs the DNS
-//! forwarder for domain rules. Without its heartbeat, eBPF leaves all
-//! traffic to the standard route.
+//! tunnels to every server (see edup-ebpf-client) and keep a route, a server
+//! or direct, per destination address. Userspace installs no routes. It
+//! answers route lookups for destinations the cache does not know yet, which
+//! arrive as packets through the TUN device, re-injects those packets, sends
+//! KEEPALIVE to each server and runs the DNS forwarder for domain rules.
+//! Without its heartbeat, eBPF leaves all traffic to the standard route.
 //!
 //! On a router, `from` rules form a permanent client table in eBPF: LAN
 //! interfaces classify each source before masquerading, and the egress hook
-//! proxies or bypasses those clients without lookups. SIGHUP reloads the
-//! table from the configuration file.
+//! sends those clients through their server or direct without lookups.
+//! SIGHUP reloads the table from the configuration file.
 use crate::{
     config::{Action, Settings, Target, XdpMode},
     create_device, dns,
@@ -28,8 +28,8 @@ use aya::{
 use edup_common::{
     key::derive_key,
     maps::{
-        CLIENT_ENTRIES, CLIENT_MARK, ClientConfig, Keystream, MODE_BYPASS, MODE_PROXY, MODE_RULES,
-        ROUTE_BYPASS, ROUTE_PROXY, RouteEntry, SYSTEM_ENTRIES, client_stat,
+        CLIENT_ENTRIES, CLIENT_MARK, ClientConfig, Keystream, MODE_DIRECT, MODE_RULES, MODE_SERVER,
+        MODE_SHIFT, MODE_TUNNEL, RouteEntry, SYSTEM_ENTRIES, ServerConfig, TunnelKey, client_stat,
     },
     wire::{self, Key},
 };
@@ -64,12 +64,42 @@ unsafe impl Pod for Route {}
 #[derive(Clone, Copy)]
 struct Stream(Keystream);
 unsafe impl Pod for Stream {}
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Server(ServerConfig);
+unsafe impl Pod for Server {}
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Tunnel(TunnelKey);
+unsafe impl Pod for Tunnel {}
 
-/// Stores the key's stream words, which eBPF XORs with every packet.
-fn set_keystream(bpf: &mut Ebpf, key: &Key) -> Result<()> {
-    let mut map: Array<_, Stream> =
+/// Mark of the tunnels' own packets: keepalives and encapsulated packets.
+const TUNNEL_MARK: u32 = CLIENT_MARK | (MODE_TUNNEL as u32) << MODE_SHIFT;
+
+/// Stores server `index`: its address, user and key stream words, which
+/// eBPF XORs with every packet.
+fn set_server(bpf: &mut Ebpf, index: u32, address: SocketAddr, user: i64, key: &Key) -> Result<()> {
+    let mut stream: Array<_, Stream> =
         Array::try_from(bpf.map_mut("KEYSTREAM").context("missing KEYSTREAM")?)?;
-    map.set(0, Stream(Keystream::new(key)), 0)?;
+    stream.set(index, Stream(Keystream::new(key)), 0)?;
+    let mut server = ServerConfig {
+        user,
+        port_be: address.port().to_be(),
+        ..ServerConfig::default()
+    };
+    let ip = octets(address.ip());
+    server.address[..ip.len()].copy_from_slice(&ip);
+    let mut servers: Array<_, Server> =
+        Array::try_from(bpf.map_mut("SERVERS").context("missing SERVERS")?)?;
+    servers.set(index, Server(server), 0)?;
+    let tunnel = TunnelKey {
+        address: server.address,
+        port_be: server.port_be,
+        _pad: [0; 2],
+    };
+    let mut tunnels: HashMap<_, Tunnel, u32> =
+        HashMap::try_from(bpf.map_mut("TUNNELS").context("missing TUNNELS")?)?;
+    tunnels.insert(Tunnel(tunnel), index, 0)?;
     Ok(())
 }
 
@@ -101,12 +131,25 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
     // Rule-sets download before the datapath can capture any traffic.
     let rules = routing::resolve(&cfg)?;
     let clients = routing::clients(&cfg);
-    let v6 = cfg.server.is_ipv6();
-    let family = Family::of(cfg.server.ip());
-    let physical = routes::PhysicalRoute::discover(cfg.server.ip())?;
+    let v6 = cfg.ipv6();
+    let family = rules.family();
+    let servers = cfg.server_ips();
+    let physical = routes::PhysicalRoute::discover(servers[0])?;
     let (dev, physical_index) = physical.device();
     let dev = dev.to_owned();
     let local = physical.source();
+    // One egress hook and one socket carry every tunnel.
+    for (server, &ip) in cfg.servers.iter().zip(&servers).skip(1) {
+        let route = routes::PhysicalRoute::discover(ip)?;
+        ensure!(
+            route.device().1 == physical_index && route.source() == local,
+            "server {:?} is reached through {} from {}, but {:?} through {dev} from {local}; xdp mode needs every server on one interface and source address",
+            server.tag,
+            route.device().0,
+            route.source(),
+            cfg.servers[0].tag,
+        );
+    }
     let link = Path::new("/sys/class/net").join(&dev);
     let l3 = link_layer(&dev)?;
     let link_mtu: usize = fs::read_to_string(link.join("mtu"))?.trim().parse()?;
@@ -148,24 +191,26 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
         warn_proxied_resolvers(&rules, &clients, local, &system, v6)?;
     }
 
-    // KEEPALIVE and the datapath share this socket's port.
+    // KEEPALIVE and every tunnel share this socket's port. Its mark keeps
+    // the keepalives on the standard route.
     let socket = UdpSocket::bind((local, 0)).context("bind UDP on physical source address")?;
-    set_mark(&socket, CLIENT_MARK)?;
-    socket.connect(cfg.server)?;
+    set_mark(&socket, TUNNEL_MARK)?;
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     socket.set_write_timeout(Some(Duration::from_millis(200)))?;
     let reinject = Reinject::new(v6, CLIENT_MARK)?;
-    let tun = create_device(&cfg)?;
+    let tun = create_device(&cfg, 0)?;
     let segment = Segment::create(&cfg.interface, link_mtu)?;
 
     let mut bpf = Ebpf::load(OBJECT).context("load embedded eBPF object")?;
-    let key = derive_key(&cfg.password);
-    set_keystream(&mut bpf, &key)?;
+    let keys: Vec<Key> = cfg
+        .servers
+        .iter()
+        .map(|s| derive_key(&s.password))
+        .collect();
+    for (i, (server, key)) in cfg.servers.iter().zip(&keys).enumerate() {
+        set_server(&mut bpf, i as u32, server.address, server.user, key)?;
+    }
     let mut config = ClientConfig {
-        key0: key.k0,
-        key1: key.k1,
-        user: cfg.user,
-        server_port_be: cfg.server.port().to_be(),
         local_port_be: socket.local_addr()?.port().to_be(),
         mtu: cfg.mtu,
         v6: v6.into(),
@@ -191,8 +236,6 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
         }
     }
     config.local[..octets(local).len()].copy_from_slice(&octets(local));
-    let server = octets(cfg.server.ip());
-    config.server[..server.len()].copy_from_slice(&server);
     let mut client_config: Array<_, Config> = Array::try_from(
         bpf.take_map("CLIENT_CONFIG")
             .context("missing CLIENT_CONFIG")?,
@@ -208,7 +251,7 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
     )?;
     let mut direct = PrefixTable::new(bpf.take_map("SYSTEM").context("missing SYSTEM")?)?;
     direct.update(
-        direct_prefixes(v6)?,
+        direct_prefixes(v6, &servers)?,
         SYSTEM_ENTRIES,
         "local networks and addresses",
     )?;
@@ -239,7 +282,7 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
         hosts: Mutex::new(std::collections::HashMap::new()),
         cache: Mutex::new(cache),
     };
-    let address = tunnel_address(&cfg)?;
+    let address = tunnel_address(&cfg, 0)?;
     let forwarder = SocketAddr::new(address, cfg.dns.port);
     let mut _system_dns = None;
     let dns = if rules.uses_dns() {
@@ -255,14 +298,23 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
         None
     };
     let counts = Counters::default();
+    let server_text = match &cfg.servers[..] {
+        [server] => format!("server={}", server.address),
+        all => {
+            let list: Vec<String> = all
+                .iter()
+                .map(|s| format!("{} {}", s.tag, s.address))
+                .collect();
+            format!("servers={}", list.join(", "))
+        }
+    };
     println!(
-        "edup client ready: {} {}, server={}, MTU={}, mode=xdp ({} on {dev}, source {local}){}{}",
+        "edup client ready: {} {}, {server_text}, MTU={}, mode=xdp ({} on {dev}, source {local}){}{}",
         cfg.interface,
         address,
-        cfg.server,
         cfg.mtu,
         datapath.mode,
-        clients_text(&table, &lan, local, config.local_mode),
+        clients_text(&cfg, &table, &lan, local, config.local_mode),
         if dns.is_some() {
             format!(", DNS={forwarder}")
         } else {
@@ -298,13 +350,23 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
                     "warning: the configuration changed beyond \"from\" rules; restart edup-client to apply it"
                 );
             }
+            // The client table names servers by their index in eBPF.
+            let same = |a: &crate::config::Server, b: &crate::config::Server| {
+                (a.tag.as_str(), a.address, a.user, a.password.as_str())
+                    == (b.tag.as_str(), b.address, b.user, b.password.as_str())
+            };
             ensure!(
-                next.server.is_ipv6() == v6,
-                "the server's address family changed"
+                next.servers.len() == cfg.servers.len()
+                    && next
+                        .servers
+                        .iter()
+                        .zip(&cfg.servers)
+                        .all(|(a, b)| same(a, b)),
+                "the servers changed; restart edup-client to apply them"
             );
             let clients = routing::clients(&next);
             direct.update(
-                direct_prefixes(v6)?,
+                direct_prefixes(v6, &servers)?,
                 SYSTEM_ENTRIES,
                 "local networks and addresses",
             )?;
@@ -318,7 +380,7 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
             lan.update(&mut bpf, &clients, family, &excluded, v6)?;
             println!(
                 "edup client reloaded{}",
-                clients_text(&table, &lan, local, config.local_mode)
+                clients_text(&cfg, &table, &lan, local, config.local_mode)
             );
             Ok(())
         })();
@@ -347,7 +409,7 @@ pub fn run(cfg: Settings, path: &Path) -> Result<()> {
             let _ = event.trigger();
             result
         });
-        let result = keepalive(&socket, &cfg, &key, &counts, &stop, &report, &mut reload);
+        let result = keepalive(&socket, &cfg, &keys, &counts, &stop, &report, &mut reload);
         stop.store(true, Relaxed);
         let _ = event.trigger();
         let looked_up = worker
@@ -405,7 +467,7 @@ fn warn_flowtables() {
 }
 
 /// The host's own DNS upstreams follow the rules like its other traffic.
-/// Through the tunnel they see the server's address, which resolvers that
+/// Through a tunnel they see the server's address, which resolvers that
 /// only answer their own network, as ISP resolvers often do, refuse.
 fn warn_proxied_resolvers(
     rules: &Rules,
@@ -419,21 +481,21 @@ fn warn_proxied_resolvers(
         direct = direct.union(&IpSet::from_ranges(vec![prefix.range()]));
     }
     for ip in routes::dnsmasq_upstreams() {
-        if Family::of(ip) != Family::of(rules.server)
-            || ip == rules.server
+        if Family::of(ip) != rules.family()
+            || rules.servers.contains(&ip)
             || !unicast(ip)
             || direct.contains(key(ip))
         {
             continue;
         }
         let proxied = match clients.target(local) {
-            Target::Proxy => true,
-            Target::Bypass => false,
-            Target::Rules => rules.address_action(ip) == Action::Proxy,
+            Target::Server(_) => true,
+            Target::Direct => false,
+            Target::Rules => rules.address_action(ip) != Action::Direct,
         };
         if proxied {
             eprintln!(
-                "warning: dnsmasq's upstream DNS server {ip} is reached through the tunnel; if it only answers its own network (as ISP resolvers often do), add a bypass rule for it or use another resolver"
+                "warning: dnsmasq's upstream DNS server {ip} is reached through a tunnel; if it only answers its own network (as ISP resolvers often do), add a direct rule for it or use another resolver"
             );
         }
     }
@@ -454,15 +516,22 @@ fn configuration_core(path: &Path) -> Result<serde_json::Value> {
     Ok(value)
 }
 
+/// The eBPF mode of a client table target.
 fn mode(target: Target) -> u8 {
     match target {
-        Target::Proxy => MODE_PROXY,
-        Target::Bypass => MODE_BYPASS,
+        Target::Server(i) => MODE_SERVER + i as u8,
+        Target::Direct => MODE_DIRECT,
         Target::Rules => MODE_RULES,
     }
 }
 
-fn clients_text(table: &PrefixTable, lan: &Lan, local: IpAddr, local_mode: u8) -> String {
+fn clients_text(
+    cfg: &Settings,
+    table: &PrefixTable,
+    lan: &Lan,
+    local: IpAddr,
+    local_mode: u8,
+) -> String {
     if table.entries.is_empty() && lan.links.is_empty() {
         return String::new();
     }
@@ -476,9 +545,12 @@ fn clients_text(table: &PrefixTable, lan: &Lan, local: IpAddr, local_mode: u8) -
             interfaces.join(", ")
         },
         match local_mode {
-            MODE_PROXY => format!(", {local} proxied"),
-            MODE_BYPASS => format!(", {local} bypassed"),
-            _ => String::new(),
+            MODE_DIRECT => format!(", {local} direct"),
+            MODE_RULES => String::new(),
+            mode => format!(
+                ", {local} through {}",
+                cfg.name(Action::Server((mode - MODE_SERVER).into()))
+            ),
         }
     )
 }
@@ -500,14 +572,14 @@ fn client_entries(clients: &Clients, family: Family) -> Entries {
         .collect()
 }
 
-/// Destinations that need no route: every interface's networks and the
-/// host's own addresses.
-fn direct_prefixes(v6: bool) -> Result<Entries> {
+/// Destinations that need no route: every interface's networks, the host's
+/// own addresses and the servers.
+fn direct_prefixes(v6: bool, servers: &[IpAddr]) -> Result<Entries> {
     let mut entries: Entries = routes::interface_prefixes(v6)?
         .iter()
         .map(|(_, prefix)| (entry(prefix), 1))
         .collect();
-    for address in local_addresses(v6)? {
+    for &address in local_addresses(v6)?.iter().chain(servers) {
         entries.insert(entry(&Prefix::host(address)), 1);
     }
     Ok(entries)
@@ -739,12 +811,12 @@ struct Router<'a> {
 }
 impl Router<'_> {
     fn decide(&self, ip: IpAddr) -> Action {
-        if Family::of(ip) != Family::of(self.rules.server)
-            || ip == self.rules.server
+        if Family::of(ip) != self.rules.family()
+            || self.rules.servers.contains(&ip)
             || !unicast(ip)
             || self.system.contains(key(ip))
         {
-            return Action::Bypass;
+            return Action::Direct;
         }
         let hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
         hosts
@@ -754,14 +826,14 @@ impl Router<'_> {
     }
     fn publish(&self, ip: IpAddr) -> Result<()> {
         let action = match self.decide(ip) {
-            Action::Proxy => ROUTE_PROXY,
-            Action::Bypass => ROUTE_BYPASS,
+            Action::Server(i) => mode(Target::Server(i)),
+            Action::Direct => MODE_DIRECT,
         };
         let mut address = [0; 16];
         address[..octets(ip).len()].copy_from_slice(&octets(ip));
         let route = Route(RouteEntry {
             since_ns: 0,
-            action,
+            action: action.into(),
             _pad: 0,
         });
         self.cache
@@ -865,13 +937,13 @@ fn destination(packet: &[u8], v6: bool) -> Option<IpAddr> {
     }
 }
 
-/// KEEPALIVE keeps the server's endpoint for this socket current; the server
-/// answers each one. Tunnel data never reaches the socket: eBPF takes it first.
-/// Reload requests run here, between receive timeouts.
+/// KEEPALIVE keeps each server's endpoint for this socket current; the
+/// servers answer each one. Tunnel data never reaches the socket: eBPF takes
+/// it first. Reload requests run here, between receive timeouts.
 fn keepalive(
     socket: &UdpSocket,
     cfg: &Settings,
-    key: &Key,
+    keys: &[Key],
     counts: &Counters,
     stop: &AtomicBool,
     report: &dyn Fn(),
@@ -890,26 +962,35 @@ fn keepalive(
             report_at = Instant::now() + Duration::from_secs(5);
         }
         if Instant::now() >= next {
-            let mut keepalive = [0; wire::HDR_LEN];
-            wire::seal(key, wire::TYPE_KEEPALIVE, cfg.user, &mut keepalive);
-            match socket.send(&keepalive) {
-                Ok(_) => {
-                    counts.keepalive_sent.fetch_add(1, Relaxed);
+            for (server, key) in cfg.servers.iter().zip(keys) {
+                let mut keepalive = [0; wire::HDR_LEN];
+                wire::seal(key, wire::TYPE_KEEPALIVE, server.user, &mut keepalive);
+                match socket.send_to(&keepalive, server.address) {
+                    Ok(_) => {
+                        counts.keepalive_sent.fetch_add(1, Relaxed);
+                    }
+                    Err(e) if temporary(&e) => {}
+                    Err(e) => return Err(e).context("send KEEPALIVE"),
                 }
-                Err(e) if temporary(&e) => {}
-                Err(e) => return Err(e).context("send KEEPALIVE"),
             }
             next = Instant::now() + Duration::from_secs(cfg.keepalive_secs);
         }
-        let len = match socket.recv(&mut buf) {
-            Ok(len) => len,
+        let (len, from) = match socket.recv_from(&mut buf) {
+            Ok(received) => received,
             Err(e) if temporary(&e) => continue,
             Err(e) => return Err(e).context("receive UDP"),
         };
         let data = &mut buf[..len];
-        let keepalive = len == wire::HDR_LEN
-            && wire::user_id(data) == Some(cfg.user)
-            && wire::open(key, data).is_some_and(|o| o.typ == wire::TYPE_KEEPALIVE);
+        let sender = cfg
+            .servers
+            .iter()
+            .zip(keys)
+            .find(|(s, _)| s.address.ip() == from.ip() && s.address.port() == from.port());
+        let keepalive = sender.is_some_and(|(server, key)| {
+            len == wire::HDR_LEN
+                && wire::user_id(data) == Some(server.user)
+                && wire::open(key, data).is_some_and(|o| o.typ == wire::TYPE_KEEPALIVE)
+        });
         if keepalive {
             counts.keepalive_received.fetch_add(1, Relaxed);
         } else {

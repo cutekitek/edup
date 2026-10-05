@@ -2,7 +2,10 @@
 //! against the userspace wire implementation. No interface is attached.
 use super::*;
 use aya::programs::{Program, TestRun, TestRunOptions};
-use edup_common::maps::{HEARTBEAT_TIMEOUT_NS, LOOKUP_RETRY_NS, LOOKUP_WAIT_NS, ROUTE_PENDING};
+use edup_common::maps::{
+    HEARTBEAT_TIMEOUT_NS, LOOKUP_RETRY_NS, LOOKUP_WAIT_NS, MODE_DIRECT, MODE_RULES, MODE_SERVER,
+    ROUTE_PENDING,
+};
 
 const LOCAL: [u8; 4] = [198, 51, 100, 7];
 const REMOTE: [u8; 4] = [203, 0, 113, 9];
@@ -12,6 +15,11 @@ const REMOTE6: [u8; 16] = [0x20, 1, 0xd, 0xb8, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 const SERVER6: [u8; 16] = [0x20, 1, 0xd, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 const USER: i64 = 4829017365182049271;
 const KEY: Key = Key { k0: 123, k1: 456 };
+/// The second server: another address, port, user and key.
+const SERVER2: [u8; 4] = [192, 0, 2, 9];
+const SERVER2_6: [u8; 16] = [0x20, 1, 0xd, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+const USER2: i64 = -77;
+const KEY2: Key = Key { k0: 789, k1: 1011 };
 const PORT: u16 = 40000;
 const MTU: u16 = 1400;
 const MAC: [u8; 12] = [2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2];
@@ -108,12 +116,14 @@ fn frame(ip: &[u8]) -> Vec<u8> {
 
 fn load(v6: bool) -> Ebpf {
     let mut bpf = Ebpf::load(OBJECT).unwrap();
-    set_keystream(&mut bpf, &KEY).unwrap();
+    let (first, second): (IpAddr, IpAddr) = if v6 {
+        (SERVER6.into(), SERVER2_6.into())
+    } else {
+        (SERVER.into(), SERVER2.into())
+    };
+    set_server(&mut bpf, 0, SocketAddr::new(first, 7777), USER, &KEY).unwrap();
+    set_server(&mut bpf, 1, SocketAddr::new(second, 7778), USER2, &KEY2).unwrap();
     let mut config = ClientConfig {
-        key0: KEY.k0,
-        key1: KEY.k1,
-        user: USER,
-        server_port_be: 7777u16.to_be(),
         local_port_be: PORT.to_be(),
         mtu: MTU,
         v6: v6.into(),
@@ -125,10 +135,8 @@ fn load(v6: bool) -> Ebpf {
     };
     if v6 {
         config.local = LOCAL6;
-        config.server = SERVER6;
     } else {
         config.local[..4].copy_from_slice(&LOCAL);
-        config.server[..4].copy_from_slice(&SERVER);
     }
     Array::<_, Config>::try_from(bpf.map_mut("CLIENT_CONFIG").unwrap())
         .unwrap()
@@ -189,9 +197,12 @@ fn run_marked(bpf: &Ebpf, name: &str, input: &[u8], mark: u32) -> (u32, Vec<u8>,
     (result.return_value, out, mark)
 }
 fn sealed(inner: &[u8], to_server: bool) -> Vec<u8> {
+    sealed_for(&KEY, USER, inner, to_server)
+}
+fn sealed_for(key: &Key, user: i64, inner: &[u8], to_server: bool) -> Vec<u8> {
     let mut data = vec![0; wire::HDR_LEN];
     data.extend(inner);
-    let len = wire::seal_data(&KEY, USER, &mut data, to_server).unwrap();
+    let len = wire::seal_data(key, user, &mut data, to_server).unwrap();
     data.truncate(len);
     data
 }
@@ -222,6 +233,8 @@ fn encapsulation_matches_userspace_sealing() {
         let name = if v6 { "edup_encap6" } else { "edup_encap4" };
         let ping = if v6 { (58, 128) } else { (1, 8) };
         let largest = MTU as usize - hlen - 8;
+        // Packets for the first server: the egress hook's mark names it.
+        let first = mode_mark(MODE_SERVER);
         for (proto, l4) in [
             (17, udp(1234, 53, &[0x5a; 100])),
             (17, udp(1234, 53, &vec![0x6b; largest])),
@@ -230,8 +243,9 @@ fn encapsulation_matches_userspace_sealing() {
             (ping.0, echo(ping.1)),
         ] {
             let inner = ip(local, remote, proto, l4);
-            let (code, out) = run(&bpf, name, &frame(&inner), 0);
+            let (code, out, mark) = run_marked(&bpf, name, &frame(&inner), first);
             assert_eq!(code, REDIRECT, "v6={v6} proto={proto}");
+            assert_eq!(mark, TUNNEL_MARK);
             assert_eq!(&out[..12], &MAC);
             let outer = &out[14..];
             if v6 {
@@ -271,12 +285,32 @@ fn encapsulation_matches_userspace_sealing() {
         );
         let foreign = ip(remote, remote, 17, udp(1, 2, &[0; 8]));
         for packet in [big, unreachable, foreign] {
-            assert_eq!(run(&bpf, name, &frame(&packet), 0).0, SHOT);
+            assert_eq!(run(&bpf, name, &frame(&packet), first).0, SHOT);
         }
         if !v6 {
             let mut fragment = ip(local, remote, 17, udp(1, 2, &[0; 8]));
             fragment[6] = 0x20;
-            assert_eq!(run(&bpf, name, &frame(&fragment), 0).0, SHOT);
+            assert_eq!(run(&bpf, name, &frame(&fragment), first).0, SHOT);
+        }
+        // The second server: its address, port, user and key.
+        let inner = ip(local, remote, 17, udp(1234, 53, &[0x5a; 100]));
+        let (code, out) = run(&bpf, name, &frame(&inner), mode_mark(MODE_SERVER + 1));
+        assert_eq!(code, REDIRECT);
+        let outer = &out[14..];
+        let second: &[u8] = if v6 { &SERVER2_6 } else { &SERVER2 };
+        let udp = if v6 {
+            assert_eq!(&outer[24..40], second);
+            &outer[40..]
+        } else {
+            assert_eq!(&outer[16..20], second);
+            &outer[20..]
+        };
+        assert_eq!(&udp[..4], &[0x9c, 0x40, 0x1e, 0x62]);
+        assert_eq!(csum(&pseudo(local, second, 17, udp)), 0);
+        assert_eq!(&udp[8..], sealed_for(&KEY2, USER2, &inner, true));
+        // Without a server's mode, or for a server that is not configured.
+        for mark in [0, mode_mark(MODE_RULES), mode_mark(MODE_SERVER + 2)] {
+            assert_eq!(run(&bpf, name, &frame(&inner), mark).0, SHOT, "{mark:x}");
         }
     }
 }
@@ -303,7 +337,25 @@ fn decapsulation_matches_userspace_unpacking() {
             assert_eq!(code, XDP_PASS, "v6={v6} proto={proto}");
             assert_eq!(out, frame(&clamped(inner)), "v6={v6} proto={proto}");
         }
-        // Everything else reaches the socket unchanged.
+        // The second server's tunnel, by its address and port.
+        let second: &[u8] = if v6 { &SERVER2_6 } else { &SERVER2 };
+        let inner = ip(remote, local, 17, udp(53, 1234, &[0x5a; 100]));
+        let input = frame(&ip(
+            second,
+            local,
+            17,
+            udp(7778, PORT, &sealed_for(&KEY2, USER2, &inner, false)),
+        ));
+        assert_eq!(run(&bpf, name, &input, 0), (XDP_PASS, frame(&inner)));
+        // Everything else reaches the socket unchanged, including the second
+        // server's data from the first server's port.
+        let foreign = frame(&ip(
+            second,
+            local,
+            17,
+            udp(7777, PORT, &sealed_for(&KEY2, USER2, &inner, false)),
+        ));
+        assert_eq!(run(&bpf, name, &foreign, 0), (XDP_PASS, foreign.clone()));
         let inner = ip(remote, local, 17, udp(53, 1234, &[1; 20]));
         let mut keepalive = [0; wire::HDR_LEN];
         wire::seal(&KEY, wire::TYPE_KEEPALIVE, USER, &mut keepalive);
@@ -362,13 +414,17 @@ fn egress_asks_userspace_once_and_falls_back() {
     assert_eq!(route(&bpf), None);
     let now = monotonic_ns();
     set_heartbeat(&mut bpf, now);
-    // Other families, sources, the server and multicast never look up.
+    // Other families, sources, multicast and the tunnels' own packets never
+    // look up.
     let other_family = frame(&ip(&LOCAL6, &REMOTE6, 17, udp(1, 2, &[0; 8])));
     let other_source = frame(&ip(&REMOTE, &REMOTE, 17, udp(1, 2, &[0; 8])));
-    let to_server = frame(&ip(&LOCAL, &SERVER, 17, udp(PORT, 7777, &[0; 9])));
     let multicast = frame(&ip(&LOCAL, &[224, 0, 0, 251], 17, udp(5353, 5353, &[0; 8])));
-    for input in [&other_family, &other_source, &to_server, &multicast] {
+    for input in [&other_family, &other_source, &multicast] {
         assert_eq!(run(&bpf, "edup_egress4", input, 0).0, UNSPEC);
+    }
+    let to_server = frame(&ip(&LOCAL, &SERVER, 17, udp(PORT, 7777, &[0; 9])));
+    for input in [&to_server, &packet] {
+        assert_eq!(run(&bpf, "edup_egress4", input, TUNNEL_MARK).0, UNSPEC);
     }
     // A re-injected packet without a route is not asked about again.
     assert_eq!(run(&bpf, "edup_egress4", &packet, CLIENT_MARK).0, UNSPEC);
@@ -389,14 +445,21 @@ fn egress_asks_userspace_once_and_falls_back() {
     set_route(&mut bpf, ROUTE_PENDING, old);
     assert_eq!(run(&bpf, "edup_egress4", &packet, 0).0, REDIRECT);
     assert!(route(&bpf).unwrap().since_ns > old);
-    // Answers, including for re-injected packets.
-    set_route(&mut bpf, ROUTE_PROXY, 0);
-    assert_eq!(run(&bpf, "edup_egress4", &packet, 0).0, REDIRECT);
-    assert_eq!(run(&bpf, "edup_egress4", &packet, CLIENT_MARK).0, REDIRECT);
-    set_route(&mut bpf, ROUTE_BYPASS, 0);
+    // Answers, including for re-injected packets; the mark names the server
+    // for the encapsulation hook.
+    set_route(&mut bpf, MODE_SERVER.into(), 0);
+    let (code, _, mark) = run_marked(&bpf, "edup_egress4", &packet, 0);
+    assert_eq!((code, mark), (REDIRECT, mode_mark(MODE_SERVER)));
+    set_route(&mut bpf, (MODE_SERVER + 1).into(), 0);
+    let (code, _, mark) = run_marked(&bpf, "edup_egress4", &packet, CLIENT_MARK);
+    assert_eq!(
+        (code, mark),
+        (REDIRECT, CLIENT_MARK | mode_mark(MODE_SERVER + 1))
+    );
+    set_route(&mut bpf, MODE_DIRECT.into(), 0);
     assert_eq!(run(&bpf, "edup_egress4", &packet, 0).0, UNSPEC);
     // A stale heartbeat sends even proxied destinations the standard route.
-    set_route(&mut bpf, ROUTE_PROXY, 0);
+    set_route(&mut bpf, MODE_SERVER.into(), 0);
     set_heartbeat(&mut bpf, monotonic_ns() - HEARTBEAT_TIMEOUT_NS - 1);
     assert_eq!(run(&bpf, "edup_egress4", &packet, 0).0, UNSPEC);
 
@@ -447,20 +510,20 @@ fn classifier_marks_client_modes() {
                 "192.168.2.1",
             )
         };
-        insert_prefix(&mut bpf, "CLIENTS", client, MODE_BYPASS.into());
-        insert_prefix(&mut bpf, "CLIENTS", proxied, MODE_PROXY.into());
+        insert_prefix(&mut bpf, "CLIENTS", client, MODE_DIRECT.into());
+        insert_prefix(&mut bpf, "CLIENTS", proxied, MODE_SERVER.into());
         let remote: &[u8] = if v6 { &REMOTE6 } else { &REMOTE };
         let packet = |src: &str| {
             let src = octets(src.parse().unwrap());
             frame(&ip(&src, remote, 17, udp(1, 2, &[0; 8])))
         };
         for (src, mode) in [
-            (proxied, MODE_PROXY),
-            (bypassed, MODE_BYPASS),
+            (proxied, MODE_SERVER),
+            (bypassed, MODE_DIRECT),
             (other, MODE_RULES),
         ] {
             // Other mark bits stay; an earlier mode byte is replaced.
-            for before in [0, 0x1234, mode_mark(MODE_PROXY) | 0x10] {
+            for before in [0, 0x1234, mode_mark(MODE_SERVER) | 0x10] {
                 let (code, out, mark) = run_marked(&bpf, name, &packet(src), before);
                 assert_eq!(code, UNSPEC);
                 assert_eq!(out, packet(src));
@@ -490,7 +553,10 @@ fn classifier_marks_client_modes() {
             17,
             udp(1, 2, &[0; 8]),
         ));
-        assert_eq!(run(&bpf, name, &lan, 0).0, UNSPEC);
+        // On-link destinations and the servers (both in SYSTEM) go direct,
+        // which spares the egress hook a cache lookup.
+        let (code, _, mark) = run_marked(&bpf, name, &lan, 0);
+        assert_eq!((code, mark), (UNSPEC, mode_mark(MODE_DIRECT)));
         assert_eq!(run(&bpf, name, &packet(other), 0).0, REDIRECT);
         let mut key = [0; 16];
         key[..4].copy_from_slice(&REMOTE);
@@ -544,21 +610,30 @@ fn egress_applies_client_modes() {
     let other = 0x1234;
     // Bypassed and proxied clients never look up.
     assert_eq!(
-        egress(&bpf, &packet, mode_mark(MODE_BYPASS) | other),
+        egress(&bpf, &packet, mode_mark(MODE_DIRECT) | other),
         UNSPEC
     );
     assert_eq!(
-        egress(&bpf, &packet, mode_mark(MODE_PROXY) | other),
+        egress(&bpf, &packet, mode_mark(MODE_SERVER) | other),
         REDIRECT
     );
     assert!(route(&bpf, REMOTE).is_none());
     assert_eq!(stats(&bpf, client_stat::PROXY), 1);
-    // The interface's own networks stay direct even for proxied clients.
+    // A client of the second server keeps its mode for the encapsulation hook.
+    let second = mode_mark(MODE_SERVER + 1) | other;
+    let (code, _, mark) = run_marked(&bpf, "edup_egress4", &packet, second);
+    assert_eq!((code, mark), (REDIRECT, second));
+    assert_eq!(stats(&bpf, client_stat::PROXY), 2);
+    // The interface's own networks and the servers stay direct even for
+    // proxied clients.
+    insert_prefix(&mut bpf, "SYSTEM", "192.0.2.9/32", 1);
     let to_peer = frame(&ip(&LOCAL, &peer, 6, syn(2)));
-    assert_eq!(egress(&bpf, &to_peer, mode_mark(MODE_PROXY)), UNSPEC);
+    assert_eq!(egress(&bpf, &to_peer, mode_mark(MODE_SERVER)), UNSPEC);
+    let to_server = frame(&ip(&LOCAL, &SERVER2, 6, syn(2)));
+    assert_eq!(egress(&bpf, &to_server, mode_mark(MODE_SERVER)), UNSPEC);
     // Without masquerading the tunnel cannot carry a client's packets.
     let unmasqueraded = frame(&ip(&[192, 168, 1, 60], &REMOTE, 6, syn(2)));
-    assert_eq!(egress(&bpf, &unmasqueraded, mode_mark(MODE_PROXY)), UNSPEC);
+    assert_eq!(egress(&bpf, &unmasqueraded, mode_mark(MODE_SERVER)), UNSPEC);
     assert_eq!(stats(&bpf, client_stat::FOREIGN_SOURCE), 1);
     // "rules" clients were looked up by the classifier, before masquerading;
     // the egress hook only applies a known route to them.
@@ -584,10 +659,10 @@ fn egress_applies_client_modes() {
     key[..4].copy_from_slice(&REMOTE);
     HashMap::<_, [u8; 16], Route>::try_from(bpf.map_mut("ROUTES").unwrap())
         .unwrap()
-        .insert(key, route_entry(ROUTE_PROXY), 0)
+        .insert(key, route_entry(MODE_SERVER.into()), 0)
         .unwrap();
     assert_eq!(egress(&bpf, &packet, mode_mark(MODE_RULES)), REDIRECT);
-    assert_eq!(stats(&bpf, client_stat::PROXY), 2);
+    assert_eq!(stats(&bpf, client_stat::PROXY), 3);
     HashMap::<_, [u8; 16], Route>::try_from(bpf.map_mut("ROUTES").unwrap())
         .unwrap()
         .insert(key, route_entry(ROUTE_PENDING), 0)
@@ -597,20 +672,20 @@ fn egress_applies_client_modes() {
         .unwrap()
         .get(&0, 0)
         .unwrap();
-    config.0.local_mode = MODE_PROXY;
+    config.0.local_mode = MODE_SERVER;
     Array::<_, Config>::try_from(bpf.map_mut("CLIENT_CONFIG").unwrap())
         .unwrap()
         .set(0, config, 0)
         .unwrap();
     assert_eq!(egress(&bpf, &packet, 0), REDIRECT);
-    assert_eq!(stats(&bpf, client_stat::PROXY), 3);
+    assert_eq!(stats(&bpf, client_stat::PROXY), 4);
     assert_eq!(stats(&bpf, client_stat::LOOKUP), 1);
     // A stale heartbeat sends proxied clients the standard route.
     Array::<_, u64>::try_from(bpf.map_mut("HEARTBEAT").unwrap())
         .unwrap()
         .set(0, monotonic_ns() - HEARTBEAT_TIMEOUT_NS - 1, 0)
         .unwrap();
-    assert_eq!(egress(&bpf, &packet, mode_mark(MODE_PROXY)), UNSPEC);
+    assert_eq!(egress(&bpf, &packet, mode_mark(MODE_SERVER)), UNSPEC);
 }
 
 #[test]
