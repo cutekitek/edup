@@ -49,6 +49,15 @@ jobs:
             extension: ''
             archive: tar.gz
             features: ''
+          # Static executable for distributions without a matching glibc.
+          - os: ubuntu-22.04
+            platform: linux-musl
+            target: x86_64-unknown-linux-musl
+            package: edup-server
+            config: server
+            extension: ''
+            archive: tar.gz
+            features: ''
     defaults:
       run:
         shell: bash
