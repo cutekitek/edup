@@ -100,13 +100,19 @@ fn validate_path(path: &Path) -> Result<()> {
         );
         current.push(part.as_os_str());
         match fs::symlink_metadata(&current) {
+            // bpffs mounted without mode= (OpenRC/Alpine) is root-owned 1777. A
+            // sticky ancestor is fine: others cannot rename or unlink root's
+            // entries, and the instance directory itself must still be strict.
             Ok(meta) => ensure!(
                 meta.is_dir()
                     && !meta.file_type().is_symlink()
                     && meta.uid() == 0
-                    && meta.mode() & 0o022 == 0,
-                "unsafe pin directory {}",
-                current.display()
+                    && (meta.mode() & 0o022 == 0
+                        || (current != path && meta.mode() & 0o1000 != 0)),
+                "unsafe pin directory {} (mode {:o}, uid {})",
+                current.display(),
+                meta.mode() & 0o7777,
+                meta.uid()
             ),
             Err(e) if e.kind() == io::ErrorKind::NotFound && current == path => {}
             Err(e) => return Err(e).with_context(|| format!("inspect {}", current.display())),
